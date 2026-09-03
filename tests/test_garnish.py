@@ -9,11 +9,13 @@ import garnish
 from garnish import (
     MASK,
     Page,
+    Provenance,
     apply_descriptions,
     main,
     parse_descriptions,
     parse_outputs,
     parse_workspace_spec,
+    provenance_from_env,
     render_landing,
     render_page,
     slugify,
@@ -196,9 +198,9 @@ class TestRenderNested:
         assert html.count('<table class="kv">') == 2
         assert "<code>leaf</code>" in html
 
-    def test_list_of_scalars_becomes_ordered_list(self):
+    def test_list_of_scalars_becomes_unordered_list(self):
         html = render('{"arns": ["arn:a", "arn:b"]}')
-        assert '<ol class="seq">' in html
+        assert '<ul class="seq">' in html
         assert "<code>arn:a</code>" in html
 
     def test_list_of_objects_becomes_columnar_table(self):
@@ -213,9 +215,9 @@ class TestRenderNested:
         assert '<th scope="col">b</th>' in html
         assert '<span class="empty">—</span>' in html
 
-    def test_mixed_list_falls_back_to_ordered_list(self):
+    def test_mixed_list_falls_back_to_unordered_list(self):
         html = render('{"items": [{"a": 1}, "plain"]}')
-        assert '<ol class="seq">' in html
+        assert '<ul class="seq">' in html
         assert '<table class="grid">' not in html
 
     def test_empty_containers(self):
@@ -310,9 +312,80 @@ class TestPageChrome:
 
     def test_landing_source_url_renders_link(self):
         html = render_landing(
-            "T", [("prod", "prod", 1, "now")], "now", source_url="https://github.com/octo/infra"
+            "T",
+            [("prod", "prod", 1, "now", "1970-01-01T00:00:00+00:00")],
+            "now",
+            source_url="https://github.com/octo/infra",
         )
         assert '<a class="src" href="https://github.com/octo/infra">source repository</a>' in html
+
+    def test_provenance_renders_commit_and_run_links(self):
+        html = render_page(
+            Page(
+                title="T",
+                outputs=parse_outputs('{"a": 1}'),
+                generated_at="now",
+                provenance=Provenance(
+                    commit_sha="abcdef1234567890",
+                    commit_url="https://github.com/octo/infra/commit/abcdef1234567890",
+                    run_url="https://github.com/octo/infra/actions/runs/42",
+                ),
+            )
+        )
+        assert (
+            'commit <a class="src" '
+            'href="https://github.com/octo/infra/commit/abcdef1234567890">abcdef1</a>' in html
+        )
+        assert (
+            '<a class="src" href="https://github.com/octo/infra/actions/runs/42">'
+            "workflow run</a>" in html
+        )
+
+    def test_provenance_without_run_url_omits_run_link(self):
+        html = render_page(
+            Page(
+                title="T",
+                outputs=[],
+                generated_at="now",
+                provenance=Provenance(commit_sha="abcdef1", commit_url="https://c"),
+            )
+        )
+        assert "commit " in html
+        assert "workflow run" not in html
+
+    def test_provenance_omitted_by_default(self):
+        html = render('{"a": 1}')
+        assert "commit " not in html
+        assert "workflow run" not in html
+
+    def test_provenance_is_escaped(self):
+        html = render_page(
+            Page(
+                title="T",
+                outputs=[],
+                generated_at="now",
+                provenance=Provenance(
+                    commit_sha='"><script>bad',
+                    commit_url='https://example.com/"><script>bad',
+                    run_url='https://example.com/"><script>bad',
+                ),
+            )
+        )
+        assert "<script>bad" not in html
+
+    def test_landing_provenance_renders_links(self):
+        html = render_landing(
+            "T",
+            [("prod", "prod", 1, "now", "2026-01-01T00:00:00+00:00")],
+            "now",
+            provenance=Provenance(
+                commit_sha="abcdef1234567890",
+                commit_url="https://github.com/octo/infra/commit/abcdef1234567890",
+                run_url="https://github.com/octo/infra/actions/runs/42",
+            ),
+        )
+        assert ">abcdef1</a>" in html
+        assert "workflow run</a>" in html
 
     def test_footer_links_to_tofu_garnish_repo(self):
         html = render('{"a": 1}')
@@ -324,8 +397,32 @@ class TestPageChrome:
         assert "<footer>" not in html
 
     def test_landing_footer_can_be_disabled(self):
-        html = render_landing("T", [("prod", "prod", 1, "now")], "now", footer=False)
+        html = render_landing("T", [("prod", "prod", 1, "now", "")], "now", footer=False)
         assert "<footer>" not in html
+
+    def test_landing_renders_time_element_and_age_script(self):
+        html = render_landing(
+            "T",
+            [("prod", "prod", 1, "1970-01-01 00:00 UTC", "1970-01-01T00:00:00+00:00")],
+            "now",
+        )
+        assert 'updated <time datetime="1970-01-01T00:00:00+00:00">1970-01-01 00:00 UTC</time>' in (
+            html
+        )
+        assert "time[datetime]" in html
+
+    def test_landing_without_iso_timestamp_renders_plain_text(self):
+        html = render_landing("T", [("prod", "prod", 1, "sometime", "")], "now")
+        assert "updated sometime" in html
+        assert "<time" not in html
+
+    def test_landing_workspace_json_link(self):
+        html = render_landing("T", [("prod", "prod", 1, "now", "")], "now", json_links=True)
+        assert '<a class="src" href="prod/outputs.json">JSON</a>' in html
+
+    def test_landing_workspace_json_links_off_by_default(self):
+        html = render_landing("T", [("prod", "prod", 1, "now", "")], "now")
+        assert ">JSON</a>" not in html
 
     def test_data_search_includes_nested_keys_and_leaves(self):
         html = render('{"vpc": {"tags": {"Team": "Platform"}}, "subnets": [{"id": "s-1"}]}')
@@ -529,6 +626,50 @@ class TestCli:
         assert exc.value.code == 0
         assert garnish.__version__ in capsys.readouterr().out
 
+    def test_actions_env_renders_provenance(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("GITHUB_SHA", "abcdef1234567890")
+        monkeypatch.setenv("GITHUB_REPOSITORY", "octo/infra")
+        monkeypatch.setenv("GITHUB_SERVER_URL", "https://github.com")
+        monkeypatch.setenv("GITHUB_RUN_ID", "42")
+        out = tmp_path / "site"
+        main(["--input", str(FIXTURES / "dflook_json_output_path.json"), "--output-dir", str(out)])
+        html = (out / "index.html").read_text(encoding="utf-8")
+        assert 'href="https://github.com/octo/infra/commit/abcdef1234567890">abcdef1</a>' in html
+        assert 'href="https://github.com/octo/infra/actions/runs/42">workflow run</a>' in html
+
+
+class TestProvenanceFromEnv:
+    def test_none_without_actions_env(self):
+        assert provenance_from_env() is None
+
+    @pytest.mark.parametrize("missing", ["GITHUB_SHA", "GITHUB_REPOSITORY", "GITHUB_SERVER_URL"])
+    def test_none_when_any_required_var_missing(self, monkeypatch, missing):
+        monkeypatch.setenv("GITHUB_SHA", "abcdef1234567890")
+        monkeypatch.setenv("GITHUB_REPOSITORY", "octo/infra")
+        monkeypatch.setenv("GITHUB_SERVER_URL", "https://github.com")
+        monkeypatch.delenv(missing)
+        assert provenance_from_env() is None
+
+    def test_full_env(self, monkeypatch):
+        monkeypatch.setenv("GITHUB_SHA", "abcdef1234567890")
+        monkeypatch.setenv("GITHUB_REPOSITORY", "octo/infra")
+        monkeypatch.setenv("GITHUB_SERVER_URL", "https://github.com/")
+        monkeypatch.setenv("GITHUB_RUN_ID", "42")
+        prov = provenance_from_env()
+        assert prov == Provenance(
+            commit_sha="abcdef1234567890",
+            commit_url="https://github.com/octo/infra/commit/abcdef1234567890",
+            run_url="https://github.com/octo/infra/actions/runs/42",
+        )
+
+    def test_no_run_id_omits_run_url(self, monkeypatch):
+        monkeypatch.setenv("GITHUB_SHA", "abcdef1234567890")
+        monkeypatch.setenv("GITHUB_REPOSITORY", "octo/infra")
+        monkeypatch.setenv("GITHUB_SERVER_URL", "https://github.com")
+        prov = provenance_from_env()
+        assert prov is not None
+        assert prov.run_url == ""
+
 
 # ---------------------------------------------------------------------------
 # Multi-workspace mode
@@ -658,6 +799,14 @@ class TestMultiWorkspaceCli:
         assert manifest["workspaces"]["prod"]["name"] == "prod"
         assert manifest["workspaces"]["prod"]["outputs"] == 7
         assert manifest["workspaces"]["prod"]["updated"]
+        assert manifest["workspaces"]["prod"]["updated_at"]
+
+    def test_manifest_updated_at_is_iso_utc(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("SOURCE_DATE_EPOCH", "0")
+        rc, out = self._run(tmp_path, f"prod={FIXTURES / 'tofu_output_json.json'}")
+        assert rc == 0
+        manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+        assert manifest["workspaces"]["prod"]["updated_at"] == "1970-01-01T00:00:00+00:00"
 
     def test_landing_sorted_by_name(self, tmp_path):
         rc, out = self._run(
@@ -720,8 +869,174 @@ class TestMergeMode:
         out = tmp_path / "site"
         assert self._run(out, f"prod={FIXTURES / 'dflook_json_output_path.json'}") == 0
         landing = (out / "index.html").read_text(encoding="utf-8")
-        assert "updated 1970-01-01 00:00 UTC" in landing
+        assert 'updated <time datetime="1970-01-01T00:00:00+00:00">1970-01-01 00:00 UTC</time>' in (
+            landing
+        )
+
+    def test_merge_preserves_original_timestamps(self, tmp_path, monkeypatch):
+        out = tmp_path / "site"
+        monkeypatch.setenv("SOURCE_DATE_EPOCH", "0")
+        assert self._run(out, f"prod={FIXTURES / 'tofu_output_json.json'}") == 0
+        monkeypatch.setenv("SOURCE_DATE_EPOCH", str(30 * 86400))
+        assert self._run(out, f"staging={FIXTURES / 'dflook_json_output_path.json'}") == 0
+        manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+        assert manifest["workspaces"]["prod"]["updated_at"] == "1970-01-01T00:00:00+00:00"
+        assert manifest["workspaces"]["staging"]["updated_at"] == "1970-01-31T00:00:00+00:00"
+
+    def test_landing_sorted_by_recency(self, tmp_path, monkeypatch):
+        out = tmp_path / "site"
+        monkeypatch.setenv("SOURCE_DATE_EPOCH", str(30 * 86400))
+        assert self._run(out, f"prod={FIXTURES / 'tofu_output_json.json'}") == 0
+        monkeypatch.setenv("SOURCE_DATE_EPOCH", "0")
+        assert self._run(out, f"staging={FIXTURES / 'dflook_json_output_path.json'}") == 0
+        landing = (out / "index.html").read_text(encoding="utf-8")
+        assert landing.index(">prod</a>") < landing.index(">staging</a>")
+
+    def test_legacy_manifest_without_updated_at_still_sorts(self, tmp_path, monkeypatch):
+        out = tmp_path / "site"
+        out.mkdir()
+        (out / "manifest.json").write_text(
+            json.dumps(
+                {
+                    "workspaces": {
+                        "legacy": {
+                            "name": "legacy",
+                            "outputs": 1,
+                            "updated": "2030-06-01 12:00 UTC",
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("SOURCE_DATE_EPOCH", "0")
+        assert self._run(out, f"prod={FIXTURES / 'tofu_output_json.json'}") == 0
+        manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+        assert manifest["workspaces"]["legacy"]["updated_at"] == "2030-06-01T12:00:00+00:00"
+        landing = (out / "index.html").read_text(encoding="utf-8")
+        assert landing.index(">legacy</a>") < landing.index(">prod</a>")
+
+    def test_legacy_manifest_with_unparseable_updated_sorts_last(self, tmp_path):
+        out = tmp_path / "site"
+        out.mkdir()
+        (out / "manifest.json").write_text(
+            json.dumps({"workspaces": {"old": {"name": "old", "outputs": 1, "updated": "x"}}}),
+            encoding="utf-8",
+        )
+        assert self._run(out, f"prod={FIXTURES / 'tofu_output_json.json'}") == 0
+        landing = (out / "index.html").read_text(encoding="utf-8")
+        assert landing.index(">prod</a>") < landing.index(">old</a>")
+        assert "updated x" in landing
 
     def test_merge_requires_workspace(self, capsys):
         assert main(["--merge"]) == 2
         assert "requires at least one --workspace" in capsys.readouterr().err
+
+
+class TestOutputsJson:
+    def test_single_mode_writes_plain_map(self, tmp_path):
+        out = tmp_path / "site"
+        assert (
+            main(["--input", str(FIXTURES / "tofu_output_json.json"), "--output-dir", str(out)])
+            == 0
+        )
+        data = json.loads((out / "outputs.json").read_text(encoding="utf-8"))
+        assert data["cluster_endpoint"] == "https://k8s.example.com:6443"
+        assert data["instance_count"] == 3
+        assert data["vpc"]["id"] == "vpc-01463b6b84e1454ce"
+
+    def test_sensitive_outputs_omitted(self, tmp_path):
+        out = tmp_path / "site"
+        main(["--input", str(FIXTURES / "tofu_output_json.json"), "--output-dir", str(out)])
+        raw = (out / "outputs.json").read_text(encoding="utf-8")
+        assert "database_password" not in raw
+        assert "s3cr3t-hunter2" not in raw
+        assert MASK not in raw
+
+    def test_page_links_to_json(self, tmp_path):
+        out = tmp_path / "site"
+        main(["--input", str(FIXTURES / "tofu_output_json.json"), "--output-dir", str(out)])
+        html = (out / "index.html").read_text(encoding="utf-8")
+        assert '<a class="src" href="outputs.json">JSON</a>' in html
+
+    def test_workspaces_mode_writes_per_workspace_json(self, tmp_path):
+        out = tmp_path / "site"
+        rc = main(
+            [
+                "--workspace",
+                f"prod={FIXTURES / 'tofu_output_json.json'}",
+                "--workspace",
+                f"staging={FIXTURES / 'dflook_json_output_path.json'}",
+                "--output-dir",
+                str(out),
+            ]
+        )
+        assert rc == 0
+        prod = json.loads((out / "prod" / "outputs.json").read_text(encoding="utf-8"))
+        staging = json.loads((out / "staging" / "outputs.json").read_text(encoding="utf-8"))
+        assert "cluster_endpoint" in prod
+        assert "database_password" not in prod
+        assert staging
+        page = (out / "prod" / "index.html").read_text(encoding="utf-8")
+        assert '<a class="src" href="outputs.json">JSON</a>' in page
+
+    def test_landing_links_workspace_outputs_json(self, tmp_path):
+        out = tmp_path / "site"
+        main(
+            [
+                "--workspace",
+                f"prod={FIXTURES / 'tofu_output_json.json'}",
+                "--output-dir",
+                str(out),
+            ]
+        )
+        landing = (out / "index.html").read_text(encoding="utf-8")
+        assert '<a class="src" href="prod/outputs.json">JSON</a>' in landing
+
+    def test_no_outputs_json_flag_omits_landing_links(self, tmp_path):
+        out = tmp_path / "site"
+        main(
+            [
+                "--workspace",
+                f"prod={FIXTURES / 'tofu_output_json.json'}",
+                "--output-dir",
+                str(out),
+                "--no-outputs-json",
+            ]
+        )
+        landing = (out / "index.html").read_text(encoding="utf-8")
+        assert ">JSON</a>" not in landing
+
+    def test_trailing_newline(self, tmp_path):
+        out = tmp_path / "site"
+        main(["--input", str(FIXTURES / "tofu_output_json.json"), "--output-dir", str(out)])
+        assert (out / "outputs.json").read_text(encoding="utf-8").endswith("}\n")
+
+    def test_no_outputs_json_flag_skips_file_and_link(self, tmp_path):
+        out = tmp_path / "site"
+        rc = main(
+            [
+                "--input",
+                str(FIXTURES / "tofu_output_json.json"),
+                "--output-dir",
+                str(out),
+                "--no-outputs-json",
+            ]
+        )
+        assert rc == 0
+        assert not (out / "outputs.json").exists()
+        assert 'href="outputs.json"' not in (out / "index.html").read_text(encoding="utf-8")
+
+    def test_no_outputs_json_flag_in_workspaces_mode(self, tmp_path):
+        out = tmp_path / "site"
+        rc = main(
+            [
+                "--workspace",
+                f"prod={FIXTURES / 'tofu_output_json.json'}",
+                "--output-dir",
+                str(out),
+                "--no-outputs-json",
+            ]
+        )
+        assert rc == 0
+        assert not (out / "prod" / "outputs.json").exists()

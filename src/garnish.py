@@ -40,6 +40,15 @@ class Output:
     description: str = ""
 
 
+@dataclass(frozen=True)
+class Provenance:
+    """Commit and workflow run that produced a publish."""
+
+    commit_sha: str
+    commit_url: str
+    run_url: str = ""
+
+
 @dataclass
 class Page:
     """Everything needed to render the page."""
@@ -50,6 +59,28 @@ class Page:
     back_href: str = ""
     source_url: str = ""
     footer: bool = True
+    json_href: str = ""
+    provenance: Provenance | None = None
+
+
+def provenance_from_env() -> Provenance | None:
+    """Build provenance from the standard Actions environment, if present.
+
+    Requires ``GITHUB_SHA``, ``GITHUB_REPOSITORY`` and ``GITHUB_SERVER_URL``;
+    outside Actions (plain CLI use) these are absent and provenance is
+    omitted. The run link additionally needs ``GITHUB_RUN_ID``.
+    """
+    sha = os.environ.get("GITHUB_SHA", "")
+    repo = os.environ.get("GITHUB_REPOSITORY", "")
+    server = os.environ.get("GITHUB_SERVER_URL", "").rstrip("/")
+    if not (sha and repo and server):
+        return None
+    run_id = os.environ.get("GITHUB_RUN_ID", "")
+    return Provenance(
+        commit_sha=sha,
+        commit_url=f"{server}/{repo}/commit/{sha}",
+        run_url=f"{server}/{repo}/actions/runs/{run_id}" if run_id else "",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -142,6 +173,16 @@ def apply_descriptions(outputs: list[Output], descriptions: dict[str, str]) -> N
         output.description = descriptions.get(output.name, "")
 
 
+def outputs_json(outputs: list[Output]) -> str:
+    """Machine-readable ``outputs.json``: a plain name -> value map.
+
+    Sensitive outputs are omitted entirely rather than masked; a placeholder
+    string in machine-readable output is an automation trap.
+    """
+    data = {o.name: o.value for o in outputs if not o.sensitive}
+    return json.dumps(data, indent=2) + "\n"
+
+
 # ---------------------------------------------------------------------------
 # Rendering
 # ---------------------------------------------------------------------------
@@ -231,7 +272,7 @@ def _render_list(value: list, depth: int) -> str:
         + "</li>"
         for v in value
     )
-    return f'<ol class="seq">{items}</ol>'
+    return f'<ul class="seq">{items}</ul>'
 
 
 def _render_value(value: object, depth: int = 0) -> str:
@@ -298,7 +339,8 @@ th, td { border: 1px solid var(--border); padding: 0.3rem 0.6rem; text-align: le
 table.kv > tbody > tr > th { width: 30%; font-weight: 600; }
 td.act, th.act { width: 1%; white-space: nowrap; text-align: center; }
 code { font-family: ui-monospace, monospace; font-size: 0.9em; overflow-wrap: anywhere; }
-ol.seq { margin: 0.25rem 0; padding-left: 1.5rem; }
+ul.seq { margin: 0.25rem 0; padding-left: 1.5rem; list-style: disc; }
+ul.seq li::marker { color: var(--muted); }
 .scalar { display: inline-flex; align-items: baseline; gap: 0.5rem; max-width: 100%; }
 button.copy { font-size: 0.7rem; border: 1px solid var(--border); border-radius: 4px; background: transparent; color: var(--muted); cursor: pointer; padding: 0.1rem 0.4rem; }
 button.copy:hover { color: inherit; }
@@ -344,6 +386,26 @@ def _source_link(source_url: str) -> str:
     return f' · <a class="src" href="{_esc(source_url)}">source repository</a>'
 
 
+def _json_link(json_href: str) -> str:
+    """Meta-line fragment linking to the machine-readable outputs.json."""
+    if not json_href:
+        return ""
+    return f' · <a class="src" href="{_esc(json_href)}">JSON</a>'
+
+
+def _provenance_html(provenance: Provenance | None) -> str:
+    """Meta-line fragment linking the commit and workflow run behind a publish."""
+    if provenance is None:
+        return ""
+    fragment = (
+        f' · commit <a class="src" href="{_esc(provenance.commit_url)}">'
+        f"{_esc(provenance.commit_sha[:7])}</a>"
+    )
+    if provenance.run_url:
+        fragment += f' · <a class="src" href="{_esc(provenance.run_url)}">workflow run</a>'
+    return fragment
+
+
 def _document(title: str, header: str, main: str, script: str = "", footer: bool = True) -> str:
     """Wrap header/main content in the shared HTML shell."""
     script_tag = f"<script>\n{script}</script>\n" if script else ""
@@ -359,6 +421,7 @@ def _document(title: str, header: str, main: str, script: str = "", footer: bool
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="generator" content="tofu-garnish {__version__}">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>\U0001f33f</text></svg>">
 <title>{_esc(title)}</title>
 <style>
 {_CSS}</style>
@@ -387,7 +450,8 @@ def render_page(page: Page) -> str:
     header = (
         f"{back}<h1>{_esc(page.title)}</h1>\n"
         f"<p>{_plural(len(page.outputs), 'output')} · generated {_esc(page.generated_at)}"
-        f"{_source_link(page.source_url)}</p>\n"
+        f"{_provenance_html(page.provenance)}{_source_link(page.source_url)}"
+        f"{_json_link(page.json_href)}</p>\n"
         '<input id="filter" type="search" placeholder="Filter outputs by name or value…"'
         ' aria-label="Filter outputs by name or value">\n'
     )
@@ -415,31 +479,58 @@ def parse_workspace_spec(spec: str) -> tuple[str, str]:
     return name, path
 
 
+_LANDING_JS = """\
+document.querySelectorAll('time[datetime]').forEach(function (t) {
+  var s = (Date.now() - Date.parse(t.getAttribute('datetime'))) / 1000;
+  if (isNaN(s) || s < 0) { return; }
+  var units = [[86400, 'day'], [3600, 'hour'], [60, 'minute']];
+  for (var i = 0; i < units.length; i++) {
+    var n = Math.floor(s / units[i][0]);
+    if (n >= 1) {
+      t.textContent = n + ' ' + units[i][1] + (n === 1 ? '' : 's') + ' ago';
+      return;
+    }
+  }
+  t.textContent = 'just now';
+});
+"""
+
+
 def render_landing(
     title: str,
-    workspaces: list[tuple[str, str, int, str]],
+    workspaces: list[tuple[str, str, int, str, str]],
     generated_at: str,
     source_url: str = "",
     footer: bool = True,
+    provenance: Provenance | None = None,
+    json_links: bool = False,
 ) -> str:
     """Render the landing page linking to per-workspace pages.
 
-    ``workspaces`` is a list of ``(name, slug, output_count, updated)`` tuples.
+    ``workspaces`` is a list of ``(name, slug, output_count, updated,
+    updated_at)`` tuples; ``updated`` is the display string and ``updated_at``
+    the ISO timestamp the client rewrites into a relative age. With
+    ``json_links``, each card links its workspace's ``outputs.json``.
     """
     sections = []
-    for name, slug, count, updated in workspaces:
-        meta = _plural(count, "output") + (f" · updated {_esc(updated)}" if updated else "")
+    for name, slug, count, updated, updated_at in workspaces:
+        stamp = ""
+        if updated and updated_at:
+            stamp = f' · updated <time datetime="{_esc(updated_at)}">{_esc(updated)}</time>'
+        elif updated:
+            stamp = f" · updated {_esc(updated)}"
+        json_link = _json_link(f"{slug}/outputs.json") if json_links else ""
         sections.append(
             f'<section class="output ws" data-search="{_esc(name.lower())}">'
             f'<h2><a href="{_esc(slug)}/">{_esc(name)}</a></h2>'
-            f"<p>{meta}</p></section>"
+            f"<p>{_plural(count, 'output')}{stamp}{json_link}</p></section>"
         )
     header = (
         f"<h1>{_esc(title)}</h1>\n"
         f"<p>{_plural(len(workspaces), 'workspace')} · generated {_esc(generated_at)}"
-        f"{_source_link(source_url)}</p>\n"
+        f"{_provenance_html(provenance)}{_source_link(source_url)}</p>\n"
     )
-    return _document(title, header, "".join(sections) + "\n", footer=footer)
+    return _document(title, header, "".join(sections) + "\n", script=_LANDING_JS, footer=footer)
 
 
 # ---------------------------------------------------------------------------
@@ -447,14 +538,32 @@ def render_landing(
 # ---------------------------------------------------------------------------
 
 
-def _now_utc() -> str:
+def _now() -> datetime:
     """Current UTC time, honoring SOURCE_DATE_EPOCH for reproducible builds."""
     epoch = os.environ.get("SOURCE_DATE_EPOCH")
     if epoch:
-        dt = datetime.fromtimestamp(int(epoch), tz=timezone.utc)
-    else:
-        dt = datetime.now(tz=timezone.utc)
-    return dt.strftime("%Y-%m-%d %H:%M UTC")
+        return datetime.fromtimestamp(int(epoch), tz=timezone.utc)
+    return datetime.now(tz=timezone.utc)
+
+
+def _now_utc() -> str:
+    return _now().strftime("%Y-%m-%d %H:%M UTC")
+
+
+def _parse_updated(entry: dict) -> str:
+    """ISO timestamp for a manifest workspace entry.
+
+    Manifests written before ``updated_at`` existed only carry the display
+    string; parse it so preserved workspaces still sort and age correctly.
+    """
+    updated_at = str(entry.get("updated_at", ""))
+    if updated_at:
+        return updated_at
+    try:
+        dt = datetime.strptime(str(entry.get("updated", "")), "%Y-%m-%d %H:%M UTC")
+    except ValueError:
+        return ""
+    return dt.replace(tzinfo=timezone.utc).isoformat()
 
 
 def _load_outputs_file(path_str: str) -> list[Output]:
@@ -490,11 +599,15 @@ def _run_single(args: argparse.Namespace) -> int:
         generated_at=_now_utc(),
         source_url=args.source_url,
         footer=not args.no_footer,
+        json_href="" if args.no_outputs_json else "outputs.json",
+        provenance=provenance_from_env(),
     )
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     out_file = out_dir / "index.html"
     out_file.write_text(render_page(page), encoding="utf-8")
+    if not args.no_outputs_json:
+        (out_dir / "outputs.json").write_text(outputs_json(outputs), encoding="utf-8")
     print(f"garnish: wrote {out_file} ({len(outputs)} outputs)")
     return 0
 
@@ -513,7 +626,10 @@ def _read_manifest(out_dir: Path) -> dict:
 
 
 def _run_workspaces(args: argparse.Namespace) -> int:
-    generated_at = _now_utc()
+    now = _now()
+    generated_at = now.strftime("%Y-%m-%d %H:%M UTC")
+    generated_iso = now.isoformat()
+    provenance = provenance_from_env()
     workspaces: list[tuple[str, str, list[Output]]] = []
     seen_slugs: dict[str, str] = {}
     try:
@@ -545,14 +661,27 @@ def _run_workspaces(args: argparse.Namespace) -> int:
             back_href="../",
             source_url=args.source_url,
             footer=not args.no_footer,
+            json_href="" if args.no_outputs_json else "outputs.json",
+            provenance=provenance,
         )
         ws_dir = out_dir / slug
         ws_dir.mkdir(parents=True, exist_ok=True)
         (ws_dir / "index.html").write_text(render_page(page), encoding="utf-8")
-        merged[slug] = {"name": name, "outputs": len(outputs), "updated": generated_at}
+        if not args.no_outputs_json:
+            (ws_dir / "outputs.json").write_text(outputs_json(outputs), encoding="utf-8")
+        merged[slug] = {
+            "name": name,
+            "outputs": len(outputs),
+            "updated": generated_at,
+            "updated_at": generated_iso,
+        }
         print(f"garnish: wrote {ws_dir / 'index.html'} ({len(outputs)} outputs)")
 
+    for entry in merged.values():
+        entry["updated_at"] = _parse_updated(entry)
+    # Recency first; stable sort keeps the name order for equal timestamps.
     entries = sorted(merged.items(), key=lambda kv: str(kv[1].get("name", kv[0])).lower())
+    entries.sort(key=lambda kv: str(kv[1].get("updated_at", "")), reverse=True)
     landing = render_landing(
         args.title,
         [
@@ -561,12 +690,15 @@ def _run_workspaces(args: argparse.Namespace) -> int:
                 slug,
                 int(entry.get("outputs", 0)),
                 str(entry.get("updated", "")),
+                str(entry.get("updated_at", "")),
             )
             for slug, entry in entries
         ],
         generated_at,
         source_url=args.source_url,
         footer=not args.no_footer,
+        provenance=provenance,
+        json_links=not args.no_outputs_json,
     )
     (out_dir / "index.html").write_text(landing, encoding="utf-8")
     manifest = {
@@ -643,6 +775,11 @@ def main(argv: list[str] | None = None) -> int:
         "--no-footer",
         action="store_true",
         help="Omit the tofu-garnish footer from generated pages.",
+    )
+    parser.add_argument(
+        "--no-outputs-json",
+        action="store_true",
+        help="Skip writing the machine-readable outputs.json next to each page.",
     )
     parser.add_argument("--version", action="version", version=__version__)
     args = parser.parse_args(argv)
