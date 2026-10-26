@@ -7,7 +7,7 @@
   <a href="LICENSE"><img alt="License" src="https://img.shields.io/github/license/lowlydba/tofu-garnish"></a>
   <a href="https://github.com/lowlydba/tofu-garnish/releases"><img alt="Release" src="https://img.shields.io/github/v/release/lowlydba/tofu-garnish?logo=github&sort=semver"></a>
   <a href="https://docs.zizmor.sh"><img alt="zizmor: pedantic" src="https://img.shields.io/badge/zizmor-pedantic-green?logo=githubactions&logoColor=white"></a>
-  <img alt="Python" src="https://img.shields.io/badge/python-3.10%2B-blue?logo=python&logoColor=white">
+  <img alt="Python" src="https://img.shields.io/badge/python-3.12%2B-blue?logo=python&logoColor=white">
 </p>
 
 # tofu-garnish
@@ -19,7 +19,7 @@ output` or spelunking through state.
 **[👉 See it in action: live demo site][demo]**
 
 * 🔒 dependency-free (two stdlib-only Python scripts, no third-party actions)
-* 🍽️ structure-aware HTML: tables, not JSON walls
+* 🍽️ structure-aware HTML: collapsible trees, not JSON walls
 * 🏢 discrete multi-workspace publishing without clobbering
 * 🙈 sensitive outputs masked automatically
 * 🔌 plug-and-play with [dflook/terraform-github-actions][dflook]

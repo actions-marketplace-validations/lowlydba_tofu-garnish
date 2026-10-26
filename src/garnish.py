@@ -20,14 +20,26 @@ import os
 import re
 import sys
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
+from urllib.parse import quote
 
 __version__ = "1.0.0"
 
 REPO_URL = "https://github.com/lowlydba/tofu-garnish"
 
 MASK = "••••••••"
+LINK_ICON = "\U0001f517"
+CHECK_MARK = "\u2713"
+COPY_ICON = (
+    '<svg viewBox="0 0 16 16" width="12" height="12" fill="currentColor" aria-hidden="true">'
+    '<path d="M0 6.75C0 5.784.784 5 1.75 5h1.5a.75.75 0 0 1 0 1.5h-1.5a.25.25 0 0 0-.25.25v7.5'
+    "c0 .138.112.25.25.25h7.5a.25.25 0 0 0 .25-.25v-1.5a.75.75 0 0 1 1.5 0v1.5A1.75 1.75 0 0 1 "
+    '9.25 16h-7.5A1.75 1.75 0 0 1 0 14.25Z"/>'
+    '<path d="M5 1.75C5 .784 5.784 0 6.75 0h7.5C15.216 0 16 .784 16 1.75v7.5A1.75 1.75 0 0 1 '
+    "14.25 11h-7.5A1.75 1.75 0 0 1 5 9.25Zm1.75-.25a.25.25 0 0 0-.25.25v7.5c0 .138.112.25.25.25"
+    'h7.5a.25.25 0 0 0 .25-.25v-7.5a.25.25 0 0 0-.25-.25Z"/></svg>'
+)
 
 
 @dataclass
@@ -61,6 +73,7 @@ class Page:
     footer: bool = True
     json_href: str = ""
     provenance: Provenance | None = None
+    share_url: str = ""
 
 
 def provenance_from_env() -> Provenance | None:
@@ -215,72 +228,44 @@ def _raw_text(value: object) -> str:
     return json.dumps(value, indent=2)
 
 
-def _copy_button(value: object) -> str:
+def _copy_button(value: object, label: str = "value") -> str:
+    name = f"'{label}'" if label != "value" else label
+    tip = _esc(f"Copy {name}" if _is_scalar(value) else f"Copy {name} as JSON")
     return (
-        '<button class="copy" type="button" title="Copy value" '
-        f'data-raw="{_esc(_raw_text(value))}">copy</button>'
+        f'<button class="copy" type="button" title="{tip}" aria-label="{tip}" '
+        f'data-done="{CHECK_MARK}" data-raw="{_esc(_raw_text(value))}">{COPY_ICON}</button>'
     )
 
 
-def _render_mapping(value: dict, depth: int) -> str:
-    if not value:
-        return '<span class="empty">(empty map)</span>'
-    rows = []
-    for k, v in value.items():
-        act = f'<td class="act">{_copy_button(v)}</td>' if depth == 0 else ""
-        rows.append(
-            f'<tr><th scope="row">{_esc(k)}</th><td>{_render_value(v, depth + 1)}</td>{act}</tr>'
+def _render_node(key: str, value: object, depth: int) -> str:
+    """One tree node: a leaf row, or a collapsible branch for maps and lists."""
+    label = f'<span class="k">{_esc(key)}</span>'
+    copy = _copy_button(value, key)
+    if _is_scalar(value):
+        body = _render_scalar(value)
+    elif not value:
+        body = f'<span class="empty">({"empty map" if isinstance(value, dict) else "empty list"})</span>'
+    else:
+        hint = f"{{{len(value)}}}" if isinstance(value, dict) else f"[{len(value)}]"
+        open_attr = " open" if depth <= 1 else ""
+        return (
+            f'<li><details{open_attr}><summary>{label}<span class="hint">{hint}</span>{copy}'
+            f"</summary>{_render_children(value, depth + 1)}</details></li>"
         )
-    return f'<table class="kv"><tbody>{"".join(rows)}</tbody></table>'
+    return f'<li><div class="row">{label}<span class="v">{body}</span>{copy}</div></li>'
 
 
-def _render_uniform_list(value: list, depth: int) -> str:
-    """Render a list of mappings as a columnar table with one copy button per row."""
-    columns: list[str] = []
-    for item in value:
-        for key in item:
-            if key not in columns:
-                columns.append(key)
-    head = "".join(f'<th scope="col">{_esc(c)}</th>' for c in columns)
-    if depth == 0:
-        head += '<th scope="col" class="act"></th>'
-    body_rows = []
-    for item in value:
-        cells = "".join(
-            f"<td>{_render_value(item[c], depth + 1)}</td>"
-            if c in item
-            else '<td><span class="empty">—</span></td>'
-            for c in columns
-        )
-        if depth == 0:
-            cells += f'<td class="act">{_copy_button(item)}</td>'
-        body_rows.append(f"<tr>{cells}</tr>")
-    return (
-        '<table class="grid"><thead><tr>'
-        f"{head}</tr></thead><tbody>{''.join(body_rows)}</tbody></table>"
-    )
-
-
-def _render_list(value: list, depth: int) -> str:
-    if not value:
-        return '<span class="empty">(empty list)</span>'
-    if all(isinstance(item, dict) for item in value):
-        return _render_uniform_list(value, depth)
-    items = "".join(
-        f"<li>{_render_value(v, depth + 1)}"
-        + (f" {_copy_button(v)}" if depth == 0 else "")
-        + "</li>"
-        for v in value
-    )
-    return f'<ul class="seq">{items}</ul>'
+def _render_children(value: dict | list, depth: int) -> str:
+    items = value.items() if isinstance(value, dict) else enumerate(value)
+    return f'<ul class="tree">{"".join(_render_node(str(k), v, depth) for k, v in items)}</ul>'
 
 
 def _render_value(value: object, depth: int = 0) -> str:
     if _is_scalar(value):
         return _render_scalar(value)
-    if isinstance(value, dict):
-        return _render_mapping(value, depth)
-    return _render_list(value, depth)
+    if not value:
+        return f'<span class="empty">({"empty map" if isinstance(value, dict) else "empty list"})</span>'
+    return _render_children(value, depth)
 
 
 def _search_terms(value: object):
@@ -296,7 +281,15 @@ def _search_terms(value: object):
         yield _raw_text(value)
 
 
-def _render_output(output: Output) -> str:
+def _link_button(url: str, label: str, cls: str = "copy", done: str = "") -> str:
+    done_attr = f' data-done="{done}"' if done else ""
+    return (
+        f'<button class="{cls}" type="button" title="Copy shareable link" '
+        f'aria-label="Copy shareable link" data-raw="{_esc(url)}"{done_attr}>{label}</button>'
+    )
+
+
+def _render_output(output: Output, share_url: str = "") -> str:
     if output.sensitive:
         body = f'<span class="sensitive">{MASK} <em>(sensitive)</em></span>'
         search = output.name.lower()
@@ -313,10 +306,15 @@ def _render_output(output: Output) -> str:
     if output.description:
         search = f"{search} {output.description.lower()}"
     desc = f'<p class="desc">{_esc(output.description)}</p>' if output.description else ""
+    share = (
+        _link_button(f"{share_url}#{quote(output.name)}", LINK_ICON, "copy anchor", CHECK_MARK)
+        if share_url
+        else ""
+    )
     return (
         f'<section class="output" id="{_esc(output.name)}" '
         f'data-name="{_esc(output.name.lower())}" data-search="{_esc(search)}">'
-        f'<h2><a href="#{_esc(output.name)}">{_esc(output.name)}</a></h2>'
+        f'<h2>{share}<a href="#{_esc(output.name)}">{_esc(output.name)}</a></h2>'
         f"{desc}{body}</section>"
     )
 
@@ -333,17 +331,30 @@ section.output { border: 1px solid var(--border); border-radius: 6px; padding: 0
 section.output h2 { margin: 0 0 0.5rem; font-size: 1.05rem; }
 section.output h2 a { color: var(--accent); text-decoration: none; }
 section.output h2 a:hover { text-decoration: underline; }
+button.anchor { padding: 0; border: 0; font-size: 0.8em; opacity: 0.35; }
+button.anchor:hover, button.anchor:focus-visible { opacity: 1; }
+section.output h2 button.anchor { margin-right: 0.4rem; }
 .desc { color: var(--muted); font-size: 0.9rem; margin: -0.35rem 0 0.5rem; }
-table { border-collapse: collapse; width: 100%; margin: 0.25rem 0; }
-th, td { border: 1px solid var(--border); padding: 0.3rem 0.6rem; text-align: left; vertical-align: top; font-size: 0.9rem; }
-table.kv > tbody > tr > th { width: 30%; font-weight: 600; }
-td.act, th.act { width: 1%; white-space: nowrap; text-align: center; }
-code { font-family: ui-monospace, monospace; font-size: 0.9em; overflow-wrap: anywhere; }
-ul.seq { margin: 0.25rem 0; padding-left: 1.5rem; list-style: disc; }
-ul.seq li::marker { color: var(--muted); }
+ul.tree { list-style: none; margin: 0; padding: 0; }
+section.output > ul.tree { margin: 0 -0.5rem; }
+ul.tree ul.tree { padding-left: 1.25rem; }
+.row, summary { display: flex; align-items: baseline; gap: 0.5rem; padding: 0.2rem 0.5rem; border-radius: 4px; font-size: 0.9rem; }
+.row { padding-left: 1.5rem; }
+.row:hover, summary:hover { background: color-mix(in srgb, var(--muted) 10%, transparent); }
+summary { cursor: pointer; list-style: none; }
+summary::-webkit-details-marker { display: none; }
+summary::before { content: "\\25B8"; width: 1rem; margin-left: -0.5rem; padding-left: 0.5rem; color: var(--muted); flex: none; }
+details[open] > summary::before { content: "\\25BE"; }
+.k { color: var(--muted); flex: none; }
+.row .k { min-width: 11rem; }
+.v { min-width: 0; }
+.hint { color: var(--muted); font-size: 0.8rem; opacity: 0.7; }
+.row button.copy, summary button.copy { margin-left: auto; opacity: 0; }
+.row:hover button.copy, summary:hover button.copy, button.copy:focus-visible { opacity: 1; }code { font-family: ui-monospace, monospace; font-size: 0.9em; overflow-wrap: anywhere; }
 .scalar { display: inline-flex; align-items: baseline; gap: 0.5rem; max-width: 100%; }
 button.copy { font-size: 0.7rem; border: 1px solid var(--border); border-radius: 4px; background: transparent; color: var(--muted); cursor: pointer; padding: 0.1rem 0.4rem; }
 button.copy:hover { color: inherit; }
+button.copy svg { display: block; }
 .empty, .null { color: var(--muted); font-style: italic; }
 .sensitive { color: var(--muted); }
 footer { margin-top: 2rem; color: var(--muted); font-size: 0.75rem; }
@@ -361,15 +372,34 @@ document.getElementById('filter').addEventListener('input', function () {
   document.querySelectorAll('section.output').forEach(function (s) {
     var show = !q || s.dataset.search.indexOf(q) !== -1;
     s.style.display = show ? '' : 'none';
+    if (show) { s.querySelectorAll('details').forEach(function (d) {
+      if (d.dataset.o === undefined) { d.dataset.o = d.open ? '1' : ''; }
+      d.open = q ? true : d.dataset.o === '1';
+    }); }
     if (show) { any = true; }
   });
   document.getElementById('no-match').style.display = any ? 'none' : 'block';
 });
+"""
+
+_COPY_JS = """\
 document.addEventListener('click', function (e) {
-  if (!e.target.matches('button.copy')) { return; }
-  navigator.clipboard.writeText(e.target.dataset.raw).then(function () {
-    e.target.textContent = 'copied!';
-    setTimeout(function () { e.target.textContent = 'copy'; }, 1200);
+  var btn = e.target.closest('button.copy');
+  if (!btn) { return; }
+  var label = btn.innerHTML;
+  var box = btn.getBoundingClientRect();
+  navigator.clipboard.writeText(btn.dataset.raw).then(function () {
+    btn.style.boxSizing = 'border-box';
+    btn.style.width = box.width + 'px';
+    btn.style.height = box.height + 'px';
+    btn.style.flex = 'none';
+    btn.style.overflow = 'hidden';
+    btn.style.whiteSpace = 'nowrap';
+    btn.textContent = btn.dataset.done || '\\u2713';
+    setTimeout(function () {
+      btn.innerHTML = label;
+      btn.removeAttribute('style');
+    }, 1200);
   });
 });
 """
@@ -386,11 +416,23 @@ def _source_link(source_url: str) -> str:
     return f' · <a class="src" href="{_esc(source_url)}">source repository</a>'
 
 
+def _absolute(base: str, href: str) -> str:
+    """Resolve ``href`` against the public site URL when one is configured."""
+    return f"{base}{href}" if href else ""
+
+
 def _json_link(json_href: str) -> str:
     """Meta-line fragment linking to the machine-readable outputs.json."""
     if not json_href:
         return ""
     return f' · <a class="src" href="{_esc(json_href)}">JSON</a>'
+
+
+def _share_fragment(share_url: str) -> str:
+    """Meta-line fragment with a button copying the page's shareable URL."""
+    if not share_url:
+        return ""
+    return " · " + _link_button(share_url, LINK_ICON, "copy anchor", CHECK_MARK)
 
 
 def _provenance_html(provenance: Provenance | None) -> str:
@@ -439,7 +481,7 @@ def _document(title: str, header: str, main: str, script: str = "", footer: bool
 def render_page(page: Page) -> str:
     """Render the full, self-contained HTML document."""
     if page.outputs:
-        sections = "".join(_render_output(o) for o in page.outputs)
+        sections = "".join(_render_output(o, page.share_url) for o in page.outputs)
     else:
         sections = '<p class="empty">No outputs found.</p>'
     back = (
@@ -451,12 +493,13 @@ def render_page(page: Page) -> str:
         f"{back}<h1>{_esc(page.title)}</h1>\n"
         f"<p>{_plural(len(page.outputs), 'output')} · generated {_esc(page.generated_at)}"
         f"{_provenance_html(page.provenance)}{_source_link(page.source_url)}"
-        f"{_json_link(page.json_href)}</p>\n"
+        f"{_json_link(_absolute(page.share_url, page.json_href))}"
+        f"{_share_fragment(page.share_url)}</p>\n"
         '<input id="filter" type="search" placeholder="Filter outputs by name or value…"'
         ' aria-label="Filter outputs by name or value">\n'
     )
     main = f'{sections}\n<p id="no-match" class="no-match">No outputs match the filter.</p>\n'
-    return _document(page.title, header, main, script=_JS, footer=page.footer)
+    return _document(page.title, header, main, script=_JS + _COPY_JS, footer=page.footer)
 
 
 # ---------------------------------------------------------------------------
@@ -504,6 +547,7 @@ def render_landing(
     footer: bool = True,
     provenance: Provenance | None = None,
     json_links: bool = False,
+    share_url: str = "",
 ) -> str:
     """Render the landing page linking to per-workspace pages.
 
@@ -519,7 +563,7 @@ def render_landing(
             stamp = f' · updated <time datetime="{_esc(updated_at)}">{_esc(updated)}</time>'
         elif updated:
             stamp = f" · updated {_esc(updated)}"
-        json_link = _json_link(f"{slug}/outputs.json") if json_links else ""
+        json_link = _json_link(_absolute(share_url, f"{slug}/outputs.json")) if json_links else ""
         sections.append(
             f'<section class="output ws" data-search="{_esc(name.lower())}">'
             f'<h2><a href="{_esc(slug)}/">{_esc(name)}</a></h2>'
@@ -528,9 +572,11 @@ def render_landing(
     header = (
         f"<h1>{_esc(title)}</h1>\n"
         f"<p>{_plural(len(workspaces), 'workspace')} · generated {_esc(generated_at)}"
-        f"{_provenance_html(provenance)}{_source_link(source_url)}</p>\n"
+        f"{_provenance_html(provenance)}{_source_link(source_url)}{_share_fragment(share_url)}</p>\n"
     )
-    return _document(title, header, "".join(sections) + "\n", script=_LANDING_JS, footer=footer)
+    return _document(
+        title, header, "".join(sections) + "\n", script=_LANDING_JS + _COPY_JS, footer=footer
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -542,8 +588,8 @@ def _now() -> datetime:
     """Current UTC time, honoring SOURCE_DATE_EPOCH for reproducible builds."""
     epoch = os.environ.get("SOURCE_DATE_EPOCH")
     if epoch:
-        return datetime.fromtimestamp(int(epoch), tz=timezone.utc)
-    return datetime.now(tz=timezone.utc)
+        return datetime.fromtimestamp(int(epoch), tz=UTC)
+    return datetime.now(tz=UTC)
 
 
 def _now_utc() -> str:
@@ -563,7 +609,7 @@ def _parse_updated(entry: dict) -> str:
         dt = datetime.strptime(str(entry.get("updated", "")), "%Y-%m-%d %H:%M UTC")
     except ValueError:
         return ""
-    return dt.replace(tzinfo=timezone.utc).isoformat()
+    return dt.replace(tzinfo=UTC).isoformat()
 
 
 def _load_outputs_file(path_str: str) -> list[Output]:
@@ -580,6 +626,12 @@ def _load_descriptions(path_str: str) -> dict[str, str]:
     if not path.is_file():
         raise ValueError(f"descriptions file not found: {path}")
     return parse_descriptions(path.read_text(encoding="utf-8"))
+
+
+def _share_base(url: str) -> str:
+    """Normalize the public site URL to end in exactly one slash, or ''."""
+    url = url.strip().rstrip("/")
+    return f"{url}/" if url else ""
 
 
 def _run_single(args: argparse.Namespace) -> int:
@@ -601,6 +653,7 @@ def _run_single(args: argparse.Namespace) -> int:
         footer=not args.no_footer,
         json_href="" if args.no_outputs_json else "outputs.json",
         provenance=provenance_from_env(),
+        share_url=_share_base(args.site_url),
     )
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -630,6 +683,7 @@ def _run_workspaces(args: argparse.Namespace) -> int:
     generated_at = now.strftime("%Y-%m-%d %H:%M UTC")
     generated_iso = now.isoformat()
     provenance = provenance_from_env()
+    share_base = _share_base(args.site_url)
     workspaces: list[tuple[str, str, list[Output]]] = []
     seen_slugs: dict[str, str] = {}
     try:
@@ -663,6 +717,7 @@ def _run_workspaces(args: argparse.Namespace) -> int:
             footer=not args.no_footer,
             json_href="" if args.no_outputs_json else "outputs.json",
             provenance=provenance,
+            share_url=f"{share_base}{slug}/" if share_base else "",
         )
         ws_dir = out_dir / slug
         ws_dir.mkdir(parents=True, exist_ok=True)
@@ -699,6 +754,7 @@ def _run_workspaces(args: argparse.Namespace) -> int:
         footer=not args.no_footer,
         provenance=provenance,
         json_links=not args.no_outputs_json,
+        share_url=share_base,
     )
     (out_dir / "index.html").write_text(landing, encoding="utf-8")
     manifest = {
@@ -769,6 +825,17 @@ def main(argv: list[str] | None = None) -> int:
         help=(
             "URL of the repository the outputs come from. When set, a "
             "'source repository' link is rendered on every page."
+        ),
+    )
+    parser.add_argument(
+        "--site-url",
+        default="",
+        metavar="URL",
+        help=(
+            "Public base URL the site is reachable at (e.g. a custom domain "
+            "such as https://labs.example.org/my-repo). When set, pages get "
+            "'copy link' buttons that copy URLs under it instead of the "
+            "address in the browser bar."
         ),
     )
     parser.add_argument(

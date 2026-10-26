@@ -23,19 +23,18 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Set up Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      - name: Set up uv
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
         with:
+          version: "0.13.5"
           python-version: "3.13"
-
-      - name: Install ruff
-        run: python -m pip install --quiet ruff
+          enable-cache: false
 
       - name: Ruff check
-        run: ruff check .
+        run: uv run --locked ruff check .
 
       - name: Ruff format check
-        run: ruff format --check .
+        run: uv run --locked ruff format --check .
 
   test:
     name: Test (Python ${{ matrix.python-version }})
@@ -45,23 +44,22 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.10", "3.12", "3.14"]
+        python-version: ["3.12", "3.14"]
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - name: Set up Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      - name: Set up uv
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
         with:
+          version: "0.13.5"
           python-version: ${{ matrix.python-version }}
-
-      - name: Install test dependencies
-        run: python -m pip install --quiet pytest pytest-cov
+          enable-cache: false
 
       - name: Run tests with coverage
-        run: python -m pytest --cov --cov-fail-under=95
+        run: uv run --locked python -m pytest --cov --cov-fail-under=95
 
   action-test:
     name: Integration test (action)
@@ -75,7 +73,7 @@ jobs:
           persist-credentials: false
 
       - name: Run action with outputs-file input
-        uses: ./
+        uses: $/
         with:
           outputs-file: tests/fixtures/tofu_output_json.json
           title: Integration Test
@@ -83,7 +81,7 @@ jobs:
           deploy: "false"
 
       - name: Run action with inline outputs input
-        uses: ./
+        uses: $/
         with:
           outputs: '{"service_hostname": "example.com", "vpc": "{\"id\": \"vpc-123\"}"}'
           title: Inline Test
@@ -91,7 +89,7 @@ jobs:
           deploy: "false"
 
       - name: Run action with workspaces input
-        uses: ./
+        uses: $/
         with:
           workspaces: |
             prod=tests/fixtures/tofu_output_json.json
@@ -101,7 +99,7 @@ jobs:
           deploy: "false"
 
       - name: Run action again to merge a new workspace
-        uses: ./
+        uses: $/
         with:
           workspaces: |
             dev=tests/fixtures/dflook_json_output_path.json
@@ -131,7 +129,7 @@ jobs:
       - name: Verify action fails without inputs
         id: no-inputs
         continue-on-error: true
-        uses: ./
+        uses: $/
         with:
           deploy: "false"
 
@@ -188,7 +186,7 @@ jobs:
           EOF
 
       - name: Run action on real tofu output (prod workspace)
-        uses: ./
+        uses: $/
         with:
           workspaces: |
             prod=demo-outputs.json
@@ -198,7 +196,7 @@ jobs:
           deploy: "false"
 
       - name: Run action again for the staging workspace
-        uses: ./
+        uses: $/
         with:
           workspaces: |
             staging=staging-outputs.json
@@ -234,7 +232,7 @@ jobs:
           persist-credentials: false
 
       - name: Run zizmor (pedantic)
-        uses: zizmorcore/zizmor-action@3dc1ecc9bcb9e94e9b2c709687979e1298497054 # v0.6.2
+        uses: zizmorcore/zizmor-action@85b2b9fb8e3325e7a23d7d0a9d7ba5ae0f999e3e # v0.7.1
         with:
           persona: pedantic
           # Code scanning isn't enabled on this repo; report findings as
@@ -250,6 +248,6 @@ jobs:
     permissions: {}
     steps:
       - name: Roll up job statuses
-        uses: lowlydba/are-we-good@4b62765391e357e78d0572113ab8b1c7d6b8d12a # v1.0.4
+        uses: lowlydba/are-we-good@6b10e5f2697555fbaf7f8f37ce38d4454c954a4c # v1.2.2
         with:
           jobs: ${{ toJSON(needs) }}
