@@ -2,6 +2,17 @@
 
 # Reference
 
+On this page:
+
+- [Action inputs](#action-inputs)
+- [Action outputs](#action-outputs)
+- [Accepted input formats](#accepted-input-formats)
+- [Site structure (workspaces mode)](#site-structure-workspaces-mode)
+- [Machine-readable outputs.json](#machine-readable-outputsjson)
+- [Change detection (show-changes)](#change-detection-show-changes)
+- [Workflow requirements (when deploying)](#workflow-requirements-when-deploying)
+- [CLI reference](#cli-reference)
+
 ## Action inputs
 
 | Input          | Required | Default             | Description                                                                                                                                    |
@@ -10,11 +21,15 @@
 | `outputs`      | no*      | none                | Inline JSON string of outputs, e.g. `toJson(steps.<id>.outputs)` from a `dflook/terraform-output` step. Ignored if `outputs-file` is set.        |
 | `workspaces`   | no*      | none                | Multiline `name=path` pairs for multi-workspace sites. Only the named workspaces are overwritten on deploy. Takes precedence over other inputs.  |
 | `module-dir`   | no       | none                | **OpenTofu ≥ 1.10 only.** Root module directory; descriptions are extracted with `tofu show -json -module` and rendered on the page.             |
+| `docs-dir`     | no       | none                | Directory of Markdown files rendered to `/docs/<name>/` and linked from the landing and output pages. `other.md` links are rewritten; repo images (png, jpg, gif, svg, webp, avif) are copied into the site. Kept across `workspaces` deploys when omitted. |
+| `site-path`    | no       | branch root         | Subdirectory of the Pages branch to publish under (e.g. `pr-preview/42`). Other files on the branch are untouched.                                |
+| `remove`       | no       | `"false"`           | `"true"` deletes `site-path` from the Pages branch instead of publishing (e.g. when a PR closes). Requires `site-path`.                           |
 | `title`        | no       | `Tofu Outputs`      | Title shown on the generated page(s).                                                                                                            |
 | `source-repo-url` | no    | current repository  | URL of the repo the outputs come from, rendered as a "source repository" link on each page. Set to `""` to omit the link.                        |
 | `site-url`    | no       | none                | Public base URL when the site is served from a vanity domain (e.g. `https://labs.example.org/my-repo`). Adds "copy link" buttons that copy URLs under it instead of the browser's address. |
 | `footer`       | no       | `"true"`            | Render the "Served with 💚 by 🌿 tofu-garnish" footer (links to this repo) on generated pages. Set `"false"` to omit it.                          |
 | `outputs-json` | no       | `"true"`            | Write a machine-readable `outputs.json` next to each generated page (sensitive outputs omitted). Set `"false"` to publish HTML only.             |
+| `show-changes` | no       | `"false"`           | Badge outputs created or updated since the previous publish, list destroyed ones, and add an "N outputs changed" count. Compares against the `outputs.json` on the Pages branch, so it needs `outputs-json`. Differences are between publishes, not exact apply times. |
 | `output-dir`   | no       | `tofu-garnish-site` | Where the site is written when `deploy` is `"false"`.                                                                                            |
 | `deploy`       | no       | `"true"`            | Commit the site to the Pages branch. Set `"false"` to only generate HTML.                                                                        |
 | `pages-branch` | no       | `gh-pages`          | Branch GitHub Pages serves from. Created automatically if missing.                                                                               |
@@ -50,6 +65,8 @@ gh-pages
 ├── .nojekyll
 ├── index.html        # landing page listing all workspaces
 ├── manifest.json     # machine-readable workspace index (used for merging)
+├── docs/             # only with docs-dir: one folder per Markdown page
+│   └── <name>/index.html
 ├── prod-us/
 │   ├── index.html
 │   └── outputs.json  # machine-readable outputs for this workspace
@@ -73,6 +90,14 @@ contract:
   machine-readable output are an automation trap.
 * Pretty-printed, UTF-8, trailing newline.
 
+## Change detection (show-changes)
+
+With `show-changes: "true"` (CLI: `--previous-dir DIR`, a directory laid out like the site that holds the previous `outputs.json`), each page is compared with the previous publish:
+
+* An output not in the previous `outputs.json` is "created"; one whose value differs is "updated"; one that is gone is listed as "destroyed".
+* Sensitive outputs are never compared by value. Their names are recorded in `.garnish-state.json` next to `outputs.json`, which the next publish reads. It's internal state, not a supported interface, and its shape can change.
+* With no previous `outputs.json`, nothing is flagged.
+
 ## Workflow requirements (when deploying)
 
 * Job permission `contents: write` (or a `github-token` that has it).
@@ -82,8 +107,11 @@ contract:
 ## CLI reference
 
 ```text
-usage: garnish [-h] [--input INPUT] [--workspace NAME=PATH] [--merge]
-               [--output-dir OUTPUT_DIR] [--title TITLE] [--version]
+usage: garnish [-h] [--input INPUT] [--workspace NAME=PATH]
+               [--descriptions PATH] [--merge] [--output-dir OUTPUT_DIR]
+               [--title TITLE] [--source-url URL] [--site-url URL]
+               [--no-footer] [--no-outputs-json] [--docs-dir DIR]
+               [--previous-dir DIR] [--version]
 
 --input       Path to a JSON outputs file, or '-' for stdin (default).
 --workspace   Named outputs file, repeatable; builds a multi-workspace site.
@@ -91,9 +119,19 @@ usage: garnish [-h] [--input INPUT] [--workspace NAME=PATH] [--merge]
                 plain {"name": "description"} map); rendered under each
                 output. OpenTofu only.
 --merge       Preserve workspaces recorded in the output dir's manifest.json.
+                Requires at least one --workspace.
 --output-dir  Directory to write the site into (default: site).
 --title       Page title (default: 'Tofu Outputs').
+--source-url  Repository URL rendered as a "source repository" link.
+--site-url    Public base URL; adds "copy link" buttons under it.
+--no-footer   Omit the tofu-garnish footer.
+--no-outputs-json  Skip writing outputs.json next to each page.
+--docs-dir    Directory of Markdown files rendered under /docs/<name>/.
+--previous-dir  Directory holding the previous publish's outputs.json; flags
+                outputs created, updated or destroyed since then.
+--version     Print the version and exit.
 ```
 
 Exit codes: `0` success, `2` bad input (missing file, invalid JSON,
-non-object top level, bad workspace spec, or clashing workspace names).
+non-object top level, bad workspace spec, clashing workspace names, or
+`--merge` without `--workspace`).

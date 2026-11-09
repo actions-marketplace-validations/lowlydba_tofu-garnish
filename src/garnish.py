@@ -14,503 +14,161 @@ Stdlib only. Accepts any of these JSON shapes and figures out which it is:
 from __future__ import annotations
 
 import argparse
-import html
 import json
 import os
-import re
+import posixpath
+import shutil
 import sys
-from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import quote, unquote
 
-__version__ = "1.0.0"
-
-REPO_URL = "https://github.com/lowlydba/tofu-garnish"
-
-MASK = "••••••••"
-LINK_ICON = "\U0001f517"
-CHECK_MARK = "\u2713"
-COPY_ICON = (
-    '<svg viewBox="0 0 16 16" width="12" height="12" fill="currentColor" aria-hidden="true">'
-    '<path d="M0 6.75C0 5.784.784 5 1.75 5h1.5a.75.75 0 0 1 0 1.5h-1.5a.25.25 0 0 0-.25.25v7.5'
-    "c0 .138.112.25.25.25h7.5a.25.25 0 0 0 .25-.25v-1.5a.75.75 0 0 1 1.5 0v1.5A1.75 1.75 0 0 1 "
-    '9.25 16h-7.5A1.75 1.75 0 0 1 0 14.25Z"/>'
-    '<path d="M5 1.75C5 .784 5.784 0 6.75 0h7.5C15.216 0 16 .784 16 1.75v7.5A1.75 1.75 0 0 1 '
-    "14.25 11h-7.5A1.75 1.75 0 0 1 5 9.25Zm1.75-.25a.25.25 0 0 0-.25.25v7.5c0 .138.112.25.25.25"
-    'h7.5a.25.25 0 0 0 .25-.25v-7.5a.25.25 0 0 0-.25-.25Z"/></svg>'
+from changes import STATE_FILE, compute_changes, state_json
+from markdown import (
+    _CONTROL_CHARS,
+    _IMAGE_SUFFIXES,
+    ASSETS_DIR,
+    _docs_order,
+    _md_href,
+    _strip_back_link,
+    doc_title,
+    render_doc,
+    render_docs_index,
+    render_markdown,
 )
+from model import (
+    DOCS_DIR,
+    MASK,
+    REPO_URL,
+    Output,
+    Page,
+    Provenance,
+    __version__,
+    provenance_from_env,
+    slugify,
+)
+from pages import render_landing, render_page
+from parsing import apply_descriptions, outputs_json, parse_descriptions, parse_outputs
+
+__all__ = [
+    "MASK",
+    "REPO_URL",
+    "Page",
+    "Provenance",
+    "__version__",
+    "_md_href",
+    "apply_descriptions",
+    "doc_title",
+    "main",
+    "parse_descriptions",
+    "parse_outputs",
+    "parse_workspace_spec",
+    "provenance_from_env",
+    "render_landing",
+    "render_markdown",
+    "render_page",
+    "slugify",
+]
 
 
-@dataclass
-class Output:
-    """A single normalized root-module output."""
+def _build_docs(docs_dir: str, out_dir: Path, args: argparse.Namespace) -> list[tuple[str, str]]:
+    """Render every ``*.md`` under ``docs_dir`` to ``<out>/docs/<slug>/index.html``.
 
-    name: str
-    value: object
-    sensitive: bool = False
-    description: str = ""
-
-
-@dataclass(frozen=True)
-class Provenance:
-    """Commit and workflow run that produced a publish."""
-
-    commit_sha: str
-    commit_url: str
-    run_url: str = ""
-
-
-@dataclass
-class Page:
-    """Everything needed to render the page."""
-
-    title: str
-    outputs: list[Output] = field(default_factory=list)
-    generated_at: str = ""
-    back_href: str = ""
-    source_url: str = ""
-    footer: bool = True
-    json_href: str = ""
-    provenance: Provenance | None = None
-    share_url: str = ""
-
-
-def provenance_from_env() -> Provenance | None:
-    """Build provenance from the standard Actions environment, if present.
-
-    Requires ``GITHUB_SHA``, ``GITHUB_REPOSITORY`` and ``GITHUB_SERVER_URL``;
-    outside Actions (plain CLI use) these are absent and provenance is
-    omitted. The run link additionally needs ``GITHUB_RUN_ID``.
+    Also writes ``<out>/docs/index.html`` listing every page. Relative links
+    resolve to other docs pages, mirroring the folder layout (``aws/setup.md``
+    becomes ``docs/aws/setup/``); links to other repo files (such as the
+    root README) point at the source repository when ``--source-url`` is set.
+    Images inside the repository are copied to ``<out>/docs/.assets/`` and
+    referenced from there; other image sources fall back to the source
+    repository's raw file URL when ``--source-url`` is set.
+    Returns ``(title, slug)`` pairs; ``README.md`` and ``index.md`` sort first.
     """
-    sha = os.environ.get("GITHUB_SHA", "")
-    repo = os.environ.get("GITHUB_REPOSITORY", "")
-    server = os.environ.get("GITHUB_SERVER_URL", "").rstrip("/")
-    if not (sha and repo and server):
-        return None
-    run_id = os.environ.get("GITHUB_RUN_ID", "")
-    return Provenance(
-        commit_sha=sha,
-        commit_url=f"{server}/{repo}/commit/{sha}",
-        run_url=f"{server}/{repo}/actions/runs/{run_id}" if run_id else "",
-    )
-
-
-# ---------------------------------------------------------------------------
-# Parsing
-# ---------------------------------------------------------------------------
-
-
-def _looks_like_tf_output_json(data: dict) -> bool:
-    """True for the ``terraform output -json`` wrapper format."""
-    if not data:
-        return False
-    return all(isinstance(v, dict) and "value" in v for v in data.values())
-
-
-def _maybe_decode_json_string(value: object) -> object:
-    """Decode strings that are JSON-encoded arrays/objects.
-
-    ``dflook/terraform-output`` step outputs encode complex types as JSON
-    strings; primitives are left alone so ``"80"`` stays the string ``"80"``.
-    """
-    if isinstance(value, str):
-        stripped = value.strip()
-        if stripped[:1] in ("{", "["):
-            try:
-                return json.loads(stripped)
-            except ValueError:
-                return value
-    return value
-
-
-def parse_outputs(text: str) -> list[Output]:
-    """Parse raw JSON text into a normalized, name-sorted list of outputs."""
-    try:
-        data = json.loads(text)
-    except ValueError as exc:
-        raise ValueError(f"input is not valid JSON: {exc}") from exc
-    if not isinstance(data, dict):
-        raise ValueError(
-            f"expected a JSON object mapping output names to values, got {type(data).__name__}"
-        )
-
-    outputs: list[Output] = []
-    if _looks_like_tf_output_json(data):
-        for name, meta in data.items():
-            outputs.append(
-                Output(
-                    name=name,
-                    value=meta["value"],
-                    sensitive=bool(meta.get("sensitive", False)),
-                )
+    root = Path(docs_dir)
+    if not root.is_dir():
+        raise ValueError(f"docs directory not found: {docs_dir}")
+    pages: dict[str, tuple[str, str, str]] = {}
+    for path in sorted(root.rglob("*.md")):
+        slug = "/".join(slugify(part) for part in path.relative_to(root).with_suffix("").parts)
+        if slug in pages:
+            raise ValueError(
+                f"docs page {path.name!r} clashes with another page (both map to {slug!r})"
             )
-    else:
-        for name, value in data.items():
-            outputs.append(Output(name=name, value=_maybe_decode_json_string(value)))
+        text = path.read_text(encoding="utf-8")
+        pages[slug] = (doc_title(text, path.stem), text, _repo_path(path))
+    known = {repo_path: slug for slug, (_, _, repo_path) in pages.items()}
 
-    outputs.sort(key=lambda o: o.name.lower())
-    return outputs
+    def resolver_for(repo_path: str, depth: int):
+        base = posixpath.dirname(repo_path)
+        up = "../" * depth
 
+        def resolve_image(link: str) -> str | None:
+            path, query_sep, query = link.partition("?")
+            decoded = unquote(path)
+            if _CONTROL_CHARS.search(decoded):
+                return "#"
+            target = posixpath.normpath(posixpath.join(base, decoded))
+            if target.startswith("..") or target.startswith("/") or Path(target).is_absolute():
+                return None
+            source = Path(target)
+            real = source.resolve()
+            if (
+                source.suffix.lower() in _IMAGE_SUFFIXES
+                and real.suffix.lower() in _IMAGE_SUFFIXES
+                and source.is_file()
+                and real.is_relative_to(Path.cwd().resolve())
+            ):
+                dest = docs_out / ASSETS_DIR / target
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(source, dest)
+                return f"{up}../{ASSETS_DIR}/{quote(target)}{query_sep}{query}"
+            if args.source_url:
+                return f"{args.source_url.rstrip('/')}/raw/HEAD/{quote(target)}{query_sep}{query}"
+            return None
 
-def parse_descriptions(text: str) -> dict[str, str]:
-    """Parse output descriptions from ``tofu show -json`` configuration JSON.
+        def resolve(link: str, image: bool = False) -> str | None:
+            if image:
+                return resolve_image(link)
+            target = posixpath.normpath(posixpath.join(base, link))
+            decoded = posixpath.normpath(posixpath.join(base, unquote(link)))
+            if decoded in known:
+                return f"{up}../{known[decoded]}/"
+            if args.source_url and not target.startswith(".."):
+                return f"{args.source_url.rstrip('/')}/blob/HEAD/{target}"
+            return None
 
-    OpenTofu only: ``tofu show -json -module=DIR`` (or ``-config``) emits the
-    configuration representation, whose ``root_module.outputs`` entries carry
-    the ``description`` argument that ``tofu output -json`` drops. A plain
-    ``{"name": "description"}`` map is accepted too.
-    """
-    try:
-        data = json.loads(text)
-    except ValueError as exc:
-        raise ValueError(f"descriptions input is not valid JSON: {exc}") from exc
-    if not isinstance(data, dict):
-        raise ValueError("descriptions input must be a JSON object")
+        return resolve
 
-    outputs = data.get("root_module", {}).get("outputs") if "root_module" in data else data
-    if not isinstance(outputs, dict):
-        return {}
-    descriptions: dict[str, str] = {}
-    for name, meta in outputs.items():
-        if isinstance(meta, str):
-            descriptions[name] = meta
-        elif isinstance(meta, dict) and isinstance(meta.get("description"), str):
-            descriptions[name] = meta["description"]
-    return descriptions
-
-
-def apply_descriptions(outputs: list[Output], descriptions: dict[str, str]) -> None:
-    """Attach descriptions to matching outputs in place."""
-    for output in outputs:
-        output.description = descriptions.get(output.name, "")
-
-
-def outputs_json(outputs: list[Output]) -> str:
-    """Machine-readable ``outputs.json``: a plain name -> value map.
-
-    Sensitive outputs are omitted entirely rather than masked; a placeholder
-    string in machine-readable output is an automation trap.
-    """
-    data = {o.name: o.value for o in outputs if not o.sensitive}
-    return json.dumps(data, indent=2) + "\n"
-
-
-# ---------------------------------------------------------------------------
-# Rendering
-# ---------------------------------------------------------------------------
-
-
-def _esc(value: object) -> str:
-    return html.escape(str(value), quote=True)
-
-
-def _render_scalar(value: object) -> str:
-    """Render a leaf value as code."""
-    if value is None:
-        return '<span class="null">null</span>'
-    text = ("true" if value else "false") if isinstance(value, bool) else str(value)
-    return f"<code>{_esc(text)}</code>"
-
-
-def _is_scalar(value: object) -> bool:
-    return not isinstance(value, (dict, list))
-
-
-def _raw_text(value: object) -> str:
-    """Clipboard text for a value: plain text for scalars, pretty JSON otherwise."""
-    if value is None:
-        return "null"
-    if isinstance(value, bool):
-        return "true" if value else "false"
-    if _is_scalar(value):
-        return str(value)
-    return json.dumps(value, indent=2)
-
-
-def _copy_button(value: object, label: str = "value") -> str:
-    name = f"'{label}'" if label != "value" else label
-    tip = _esc(f"Copy {name}" if _is_scalar(value) else f"Copy {name} as JSON")
-    return (
-        f'<button class="copy" type="button" title="{tip}" aria-label="{tip}" '
-        f'data-done="{CHECK_MARK}" data-raw="{_esc(_raw_text(value))}">{COPY_ICON}</button>'
-    )
-
-
-def _render_node(key: str, value: object, depth: int) -> str:
-    """One tree node: a leaf row, or a collapsible branch for maps and lists."""
-    label = f'<span class="k">{_esc(key)}</span>'
-    copy = _copy_button(value, key)
-    if _is_scalar(value):
-        body = _render_scalar(value)
-    elif not value:
-        body = f'<span class="empty">({"empty map" if isinstance(value, dict) else "empty list"})</span>'
-    else:
-        hint = f"{{{len(value)}}}" if isinstance(value, dict) else f"[{len(value)}]"
-        open_attr = " open" if depth <= 1 else ""
-        return (
-            f'<li><details{open_attr}><summary>{label}<span class="hint">{hint}</span>{copy}'
-            f"</summary>{_render_children(value, depth + 1)}</details></li>"
+    docs_out = out_dir / DOCS_DIR
+    for slug, (_, text, repo_path) in pages.items():
+        text = _strip_back_link(text, posixpath.dirname(repo_path), known)
+        page_dir = docs_out / slug
+        page_dir.mkdir(parents=True, exist_ok=True)
+        depth = slug.count("/")
+        (page_dir / "index.html").write_text(
+            render_doc(
+                text,
+                slug.rpartition("/")[2],
+                args.title,
+                args.source_url,
+                not args.no_footer,
+                resolver_for(repo_path, depth),
+                depth,
+            ),
+            encoding="utf-8",
         )
-    return f'<li><div class="row">{label}<span class="v">{body}</span>{copy}</div></li>'
-
-
-def _render_children(value: dict | list, depth: int) -> str:
-    items = value.items() if isinstance(value, dict) else enumerate(value)
-    return f'<ul class="tree">{"".join(_render_node(str(k), v, depth) for k, v in items)}</ul>'
-
-
-def _render_value(value: object, depth: int = 0) -> str:
-    if _is_scalar(value):
-        return _render_scalar(value)
-    if not value:
-        return f'<span class="empty">({"empty map" if isinstance(value, dict) else "empty list"})</span>'
-    return _render_children(value, depth)
-
-
-def _search_terms(value: object):
-    """Yield all keys and scalar leaf values within a value, for filtering."""
-    if isinstance(value, dict):
-        for k, v in value.items():
-            yield str(k)
-            yield from _search_terms(v)
-    elif isinstance(value, list):
-        for v in value:
-            yield from _search_terms(v)
-    else:
-        yield _raw_text(value)
-
-
-def _link_button(url: str, label: str, cls: str = "copy", done: str = "") -> str:
-    done_attr = f' data-done="{done}"' if done else ""
-    return (
-        f'<button class="{cls}" type="button" title="Copy shareable link" '
-        f'aria-label="Copy shareable link" data-raw="{_esc(url)}"{done_attr}>{label}</button>'
+        print(f"garnish: wrote {page_dir / 'index.html'}")
+    ordered = sorted(pages.items(), key=lambda kv: _docs_order(kv[0], kv[1][0]))
+    docs = [(title, slug) for slug, (title, _, _) in ordered]
+    docs_out.mkdir(parents=True, exist_ok=True)
+    (docs_out / "index.html").write_text(
+        render_docs_index(docs, args.title, args.source_url, not args.no_footer), encoding="utf-8"
     )
+    return docs
 
 
-def _render_output(output: Output, share_url: str = "") -> str:
-    if output.sensitive:
-        body = f'<span class="sensitive">{MASK} <em>(sensitive)</em></span>'
-        search = output.name.lower()
-    elif _is_scalar(output.value):
-        # A top-level scalar is its own "row": value plus one copy button.
-        body = (
-            f'<span class="scalar">{_render_scalar(output.value)}'
-            f"{_copy_button(output.value)}</span>"
-        )
-        search = f"{output.name} {_raw_text(output.value)}".lower()
-    else:
-        body = _render_value(output.value)
-        search = " ".join([output.name, *_search_terms(output.value)]).lower()
-    if output.description:
-        search = f"{search} {output.description.lower()}"
-    desc = f'<p class="desc">{_esc(output.description)}</p>' if output.description else ""
-    share = (
-        _link_button(f"{share_url}#{quote(output.name)}", LINK_ICON, "copy anchor", CHECK_MARK)
-        if share_url
-        else ""
-    )
-    return (
-        f'<section class="output" id="{_esc(output.name)}" '
-        f'data-name="{_esc(output.name.lower())}" data-search="{_esc(search)}">'
-        f'<h2>{share}<a href="#{_esc(output.name)}">{_esc(output.name)}</a></h2>'
-        f"{desc}{body}</section>"
-    )
-
-
-_CSS = """\
-:root { color-scheme: light dark; --border: #d0d7de; --muted: #656d76; --accent: #1a7f37; }
-@media (prefers-color-scheme: dark) { :root { --border: #30363d; --muted: #8b949e; --accent: #3fb950; } }
-* { box-sizing: border-box; }
-body { font-family: system-ui, sans-serif; max-width: 60rem; margin: 0 auto; padding: 1rem 1.5rem 4rem; line-height: 1.5; }
-header h1 { margin-bottom: 0.25rem; }
-header p { color: var(--muted); margin-top: 0; }
-#filter { width: 100%; padding: 0.5rem 0.75rem; font-size: 1rem; border: 1px solid var(--border); border-radius: 6px; margin: 0.5rem 0 1rem; background: transparent; color: inherit; }
-section.output { border: 1px solid var(--border); border-radius: 6px; padding: 0.75rem 1rem; margin: 0.75rem 0; overflow-x: auto; }
-section.output h2 { margin: 0 0 0.5rem; font-size: 1.05rem; }
-section.output h2 a { color: var(--accent); text-decoration: none; }
-section.output h2 a:hover { text-decoration: underline; }
-button.anchor { padding: 0; border: 0; font-size: 0.8em; opacity: 0.35; }
-button.anchor:hover, button.anchor:focus-visible { opacity: 1; }
-section.output h2 button.anchor { margin-right: 0.4rem; }
-.desc { color: var(--muted); font-size: 0.9rem; margin: -0.35rem 0 0.5rem; }
-ul.tree { list-style: none; margin: 0; padding: 0; }
-section.output > ul.tree { margin: 0 -0.5rem; }
-ul.tree ul.tree { padding-left: 1.25rem; }
-.row, summary { display: flex; align-items: baseline; gap: 0.5rem; padding: 0.2rem 0.5rem; border-radius: 4px; font-size: 0.9rem; }
-.row { padding-left: 1.5rem; }
-.row:hover, summary:hover { background: color-mix(in srgb, var(--muted) 10%, transparent); }
-summary { cursor: pointer; list-style: none; }
-summary::-webkit-details-marker { display: none; }
-summary::before { content: "\\25B8"; width: 1rem; margin-left: -0.5rem; padding-left: 0.5rem; color: var(--muted); flex: none; }
-details[open] > summary::before { content: "\\25BE"; }
-.k { color: var(--muted); flex: none; }
-.row .k { min-width: 11rem; }
-.v { min-width: 0; }
-.hint { color: var(--muted); font-size: 0.8rem; opacity: 0.7; }
-.row button.copy, summary button.copy { margin-left: auto; opacity: 0; }
-.row:hover button.copy, summary:hover button.copy, button.copy:focus-visible { opacity: 1; }code { font-family: ui-monospace, monospace; font-size: 0.9em; overflow-wrap: anywhere; }
-.scalar { display: inline-flex; align-items: baseline; gap: 0.5rem; max-width: 100%; }
-button.copy { font-size: 0.7rem; border: 1px solid var(--border); border-radius: 4px; background: transparent; color: var(--muted); cursor: pointer; padding: 0.1rem 0.4rem; }
-button.copy:hover { color: inherit; }
-button.copy svg { display: block; }
-.empty, .null { color: var(--muted); font-style: italic; }
-.sensitive { color: var(--muted); }
-footer { margin-top: 2rem; color: var(--muted); font-size: 0.75rem; }
-.back { margin: 0 0 0.25rem; font-size: 0.9rem; }
-.back a, .ws h2 a, a.src { color: var(--accent); text-decoration: none; }
-.back a:hover, .ws h2 a:hover, a.src:hover { text-decoration: underline; }
-section.ws p { color: var(--muted); margin: 0; }
-.no-match { color: var(--muted); font-style: italic; display: none; }
-"""
-
-_JS = """\
-document.getElementById('filter').addEventListener('input', function () {
-  var q = this.value.trim().toLowerCase();
-  var any = false;
-  document.querySelectorAll('section.output').forEach(function (s) {
-    var show = !q || s.dataset.search.indexOf(q) !== -1;
-    s.style.display = show ? '' : 'none';
-    if (show) { s.querySelectorAll('details').forEach(function (d) {
-      if (d.dataset.o === undefined) { d.dataset.o = d.open ? '1' : ''; }
-      d.open = q ? true : d.dataset.o === '1';
-    }); }
-    if (show) { any = true; }
-  });
-  document.getElementById('no-match').style.display = any ? 'none' : 'block';
-});
-"""
-
-_COPY_JS = """\
-document.addEventListener('click', function (e) {
-  var btn = e.target.closest('button.copy');
-  if (!btn) { return; }
-  var label = btn.innerHTML;
-  var box = btn.getBoundingClientRect();
-  navigator.clipboard.writeText(btn.dataset.raw).then(function () {
-    btn.style.boxSizing = 'border-box';
-    btn.style.width = box.width + 'px';
-    btn.style.height = box.height + 'px';
-    btn.style.flex = 'none';
-    btn.style.overflow = 'hidden';
-    btn.style.whiteSpace = 'nowrap';
-    btn.textContent = btn.dataset.done || '\\u2713';
-    setTimeout(function () {
-      btn.innerHTML = label;
-      btn.removeAttribute('style');
-    }, 1200);
-  });
-});
-"""
-
-
-def _plural(count: int, noun: str) -> str:
-    return f"{count} {noun}" if count == 1 else f"{count} {noun}s"
-
-
-def _source_link(source_url: str) -> str:
-    """Meta-line fragment linking back to the repo the outputs come from."""
-    if not source_url:
-        return ""
-    return f' · <a class="src" href="{_esc(source_url)}">source repository</a>'
-
-
-def _absolute(base: str, href: str) -> str:
-    """Resolve ``href`` against the public site URL when one is configured."""
-    return f"{base}{href}" if href else ""
-
-
-def _json_link(json_href: str) -> str:
-    """Meta-line fragment linking to the machine-readable outputs.json."""
-    if not json_href:
-        return ""
-    return f' · <a class="src" href="{_esc(json_href)}">JSON</a>'
-
-
-def _share_fragment(share_url: str) -> str:
-    """Meta-line fragment with a button copying the page's shareable URL."""
-    if not share_url:
-        return ""
-    return " · " + _link_button(share_url, LINK_ICON, "copy anchor", CHECK_MARK)
-
-
-def _provenance_html(provenance: Provenance | None) -> str:
-    """Meta-line fragment linking the commit and workflow run behind a publish."""
-    if provenance is None:
-        return ""
-    fragment = (
-        f' · commit <a class="src" href="{_esc(provenance.commit_url)}">'
-        f"{_esc(provenance.commit_sha[:7])}</a>"
-    )
-    if provenance.run_url:
-        fragment += f' · <a class="src" href="{_esc(provenance.run_url)}">workflow run</a>'
-    return fragment
-
-
-def _document(title: str, header: str, main: str, script: str = "", footer: bool = True) -> str:
-    """Wrap header/main content in the shared HTML shell."""
-    script_tag = f"<script>\n{script}</script>\n" if script else ""
-    footer_tag = (
-        "<footer>Served with \U0001f49a by "
-        f'\U0001f33f <a class="src" href="{REPO_URL}">tofu-garnish</a>.</footer>\n'
-        if footer
-        else ""
-    )
-    return f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="generator" content="tofu-garnish {__version__}">
-<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>\U0001f33f</text></svg>">
-<title>{_esc(title)}</title>
-<style>
-{_CSS}</style>
-</head>
-<body>
-<header>
-{header}</header>
-<main>
-{main}</main>
-{footer_tag}{script_tag}</body>
-</html>
-"""
-
-
-def render_page(page: Page) -> str:
-    """Render the full, self-contained HTML document."""
-    if page.outputs:
-        sections = "".join(_render_output(o, page.share_url) for o in page.outputs)
-    else:
-        sections = '<p class="empty">No outputs found.</p>'
-    back = (
-        f'<p class="back"><a href="{_esc(page.back_href)}">← all workspaces</a></p>'
-        if page.back_href
-        else ""
-    )
-    header = (
-        f"{back}<h1>{_esc(page.title)}</h1>\n"
-        f"<p>{_plural(len(page.outputs), 'output')} · generated {_esc(page.generated_at)}"
-        f"{_provenance_html(page.provenance)}{_source_link(page.source_url)}"
-        f"{_json_link(_absolute(page.share_url, page.json_href))}"
-        f"{_share_fragment(page.share_url)}</p>\n"
-        '<input id="filter" type="search" placeholder="Filter outputs by name or value…"'
-        ' aria-label="Filter outputs by name or value">\n'
-    )
-    main = f'{sections}\n<p id="no-match" class="no-match">No outputs match the filter.</p>\n'
-    return _document(page.title, header, main, script=_JS + _COPY_JS, footer=page.footer)
-
-
-# ---------------------------------------------------------------------------
-# Multi-workspace site
-# ---------------------------------------------------------------------------
-
-
-def slugify(name: str) -> str:
-    """Turn a workspace name into a safe directory name."""
-    slug = re.sub(r"[^a-z0-9._-]+", "-", name.lower()).strip("-.")
-    return slug or "workspace"
+def _repo_path(path: Path) -> str:
+    """POSIX path of ``path`` relative to the working directory (the repo root in Actions)."""
+    return Path(os.path.relpath(path)).as_posix()
 
 
 def parse_workspace_spec(spec: str) -> tuple[str, str]:
@@ -520,63 +178,6 @@ def parse_workspace_spec(spec: str) -> tuple[str, str]:
     if not sep or not name or not path:
         raise ValueError(f"invalid workspace spec {spec!r}, expected 'name=path'")
     return name, path
-
-
-_LANDING_JS = """\
-document.querySelectorAll('time[datetime]').forEach(function (t) {
-  var s = (Date.now() - Date.parse(t.getAttribute('datetime'))) / 1000;
-  if (isNaN(s) || s < 0) { return; }
-  var units = [[86400, 'day'], [3600, 'hour'], [60, 'minute']];
-  for (var i = 0; i < units.length; i++) {
-    var n = Math.floor(s / units[i][0]);
-    if (n >= 1) {
-      t.textContent = n + ' ' + units[i][1] + (n === 1 ? '' : 's') + ' ago';
-      return;
-    }
-  }
-  t.textContent = 'just now';
-});
-"""
-
-
-def render_landing(
-    title: str,
-    workspaces: list[tuple[str, str, int, str, str]],
-    generated_at: str,
-    source_url: str = "",
-    footer: bool = True,
-    provenance: Provenance | None = None,
-    json_links: bool = False,
-    share_url: str = "",
-) -> str:
-    """Render the landing page linking to per-workspace pages.
-
-    ``workspaces`` is a list of ``(name, slug, output_count, updated,
-    updated_at)`` tuples; ``updated`` is the display string and ``updated_at``
-    the ISO timestamp the client rewrites into a relative age. With
-    ``json_links``, each card links its workspace's ``outputs.json``.
-    """
-    sections = []
-    for name, slug, count, updated, updated_at in workspaces:
-        stamp = ""
-        if updated and updated_at:
-            stamp = f' · updated <time datetime="{_esc(updated_at)}">{_esc(updated)}</time>'
-        elif updated:
-            stamp = f" · updated {_esc(updated)}"
-        json_link = _json_link(_absolute(share_url, f"{slug}/outputs.json")) if json_links else ""
-        sections.append(
-            f'<section class="output ws" data-search="{_esc(name.lower())}">'
-            f'<h2><a href="{_esc(slug)}/">{_esc(name)}</a></h2>'
-            f"<p>{_plural(count, 'output')}{stamp}{json_link}</p></section>"
-        )
-    header = (
-        f"<h1>{_esc(title)}</h1>\n"
-        f"<p>{_plural(len(workspaces), 'workspace')} · generated {_esc(generated_at)}"
-        f"{_provenance_html(provenance)}{_source_link(source_url)}{_share_fragment(share_url)}</p>\n"
-    )
-    return _document(
-        title, header, "".join(sections) + "\n", script=_LANDING_JS + _COPY_JS, footer=footer
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -645,6 +246,14 @@ def _run_single(args: argparse.Namespace) -> int:
         print(f"garnish: {exc}", file=sys.stderr)
         return 2
 
+    out_dir = Path(args.output_dir)
+    changes = compute_changes(outputs, args.previous_dir) if args.previous_dir else None
+    try:
+        docs = _build_docs(args.docs_dir, out_dir, args) if args.docs_dir else []
+    except ValueError as exc:
+        print(f"garnish: {exc}", file=sys.stderr)
+        return 2
+
     page = Page(
         title=args.title,
         outputs=outputs,
@@ -654,13 +263,15 @@ def _run_single(args: argparse.Namespace) -> int:
         json_href="" if args.no_outputs_json else "outputs.json",
         provenance=provenance_from_env(),
         share_url=_share_base(args.site_url),
+        docs=docs,
+        changes=changes,
     )
-    out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     out_file = out_dir / "index.html"
     out_file.write_text(render_page(page), encoding="utf-8")
     if not args.no_outputs_json:
         (out_dir / "outputs.json").write_text(outputs_json(outputs), encoding="utf-8")
+        (out_dir / STATE_FILE).write_text(state_json(outputs), encoding="utf-8")
     print(f"garnish: wrote {out_file} ({len(outputs)} outputs)")
     return 0
 
@@ -678,6 +289,16 @@ def _read_manifest(out_dir: Path) -> dict:
     return workspaces if isinstance(workspaces, dict) else {}
 
 
+def _read_manifest_docs(out_dir: Path) -> list[tuple[str, str]]:
+    """Read the docs pages recorded in a site's manifest, if any."""
+    manifest_path = out_dir / "manifest.json"
+    try:
+        data = json.loads(manifest_path.read_text(encoding="utf-8"))
+        return [(str(d["title"]), str(d["slug"])) for d in data.get("docs", [])]
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return []
+
+
 def _run_workspaces(args: argparse.Namespace) -> int:
     now = _now()
     generated_at = now.strftime("%Y-%m-%d %H:%M UTC")
@@ -691,6 +312,8 @@ def _run_workspaces(args: argparse.Namespace) -> int:
         for spec in args.workspace:
             name, path = parse_workspace_spec(spec)
             slug = slugify(name)
+            if slug == DOCS_DIR:
+                raise ValueError(f"workspace {name!r} maps to {DOCS_DIR!r}, which is reserved")
             if slug in seen_slugs:
                 raise ValueError(
                     f"workspace {name!r} clashes with {seen_slugs[slug]!r} "
@@ -706,8 +329,19 @@ def _run_workspaces(args: argparse.Namespace) -> int:
 
     out_dir = Path(args.output_dir)
     merged: dict[str, dict] = _read_manifest(out_dir) if args.merge else {}
+    try:
+        if args.docs_dir:
+            docs = _build_docs(args.docs_dir, out_dir, args)
+        else:
+            docs = _read_manifest_docs(out_dir) if args.merge else []
+    except ValueError as exc:
+        print(f"garnish: {exc}", file=sys.stderr)
+        return 2
 
     for name, slug, outputs in workspaces:
+        changes = (
+            compute_changes(outputs, Path(args.previous_dir) / slug) if args.previous_dir else None
+        )
         page = Page(
             title=f"{args.title} · {name}",
             outputs=outputs,
@@ -718,12 +352,15 @@ def _run_workspaces(args: argparse.Namespace) -> int:
             json_href="" if args.no_outputs_json else "outputs.json",
             provenance=provenance,
             share_url=f"{share_base}{slug}/" if share_base else "",
+            docs=docs,
+            changes=changes,
         )
         ws_dir = out_dir / slug
         ws_dir.mkdir(parents=True, exist_ok=True)
         (ws_dir / "index.html").write_text(render_page(page), encoding="utf-8")
         if not args.no_outputs_json:
             (ws_dir / "outputs.json").write_text(outputs_json(outputs), encoding="utf-8")
+            (ws_dir / STATE_FILE).write_text(state_json(outputs), encoding="utf-8")
         merged[slug] = {
             "name": name,
             "outputs": len(outputs),
@@ -753,8 +390,8 @@ def _run_workspaces(args: argparse.Namespace) -> int:
         source_url=args.source_url,
         footer=not args.no_footer,
         provenance=provenance,
-        json_links=not args.no_outputs_json,
         share_url=share_base,
+        docs=docs,
     )
     (out_dir / "index.html").write_text(landing, encoding="utf-8")
     manifest = {
@@ -762,6 +399,7 @@ def _run_workspaces(args: argparse.Namespace) -> int:
         "version": __version__,
         "title": args.title,
         "workspaces": dict(entries),
+        "docs": [{"title": title, "slug": slug} for title, slug in docs],
     }
     (out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
     print(f"garnish: wrote {out_dir / 'index.html'} ({len(entries)} workspaces)")
@@ -847,6 +485,25 @@ def main(argv: list[str] | None = None) -> int:
         "--no-outputs-json",
         action="store_true",
         help="Skip writing the machine-readable outputs.json next to each page.",
+    )
+    parser.add_argument(
+        "--docs-dir",
+        default="",
+        metavar="DIR",
+        help=(
+            "Directory of Markdown files rendered as docs pages under "
+            "/docs/<name>/ and linked from the landing page and every output page."
+        ),
+    )
+    parser.add_argument(
+        "--previous-dir",
+        default="",
+        metavar="DIR",
+        help=(
+            "Directory holding the previous publish's outputs.json (and "
+            ".garnish-state.json), laid out like the site. When set, outputs added, "
+            "modified or removed since then are flagged."
+        ),
     )
     parser.add_argument("--version", action="version", version=__version__)
     args = parser.parse_args(argv)

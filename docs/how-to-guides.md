@@ -2,6 +2,19 @@
 
 # How-to guides
 
+On this page:
+
+- [Publish multiple workspaces, accounts, or tenants](#publish-multiple-workspaces-accounts-or-tenants)
+- [Update one workspace without touching the others](#update-one-workspace-without-touching-the-others)
+- [Show output descriptions on the page (OpenTofu only)](#show-output-descriptions-on-the-page-opentofu-only)
+- [Use it without dflook actions](#use-it-without-dflook-actions)
+- [Pass outputs inline instead of a file](#pass-outputs-inline-instead-of-a-file)
+- [Consume outputs from scripts and other pipelines](#consume-outputs-from-scripts-and-other-pipelines)
+- [Show what changed since the last publish](#show-what-changed-since-the-last-publish)
+- [Publish a preview for each pull request](#publish-a-preview-for-each-pull-request)
+- [Generate the HTML without deploying](#generate-the-html-without-deploying)
+- [Run the generator locally](#run-the-generator-locally)
+
 ## Publish multiple workspaces, accounts, or tenants
 
 Use the `workspaces` input, one `name=path` pair per line. Each workspace
@@ -87,7 +100,7 @@ the action at it:
 ```
 
 Sensitive outputs are automatically masked on the page (see
-[Explanation](explanation.md#sensitive-values)).
+[Explanation](explanation.md#how-are-sensitive-values-handled)).
 
 ## Pass outputs inline instead of a file
 
@@ -117,6 +130,82 @@ shape is documented in
 [Reference](reference.md#machine-readable-outputsjson). Don't want it? Set
 the `outputs-json` input to `"false"`.
 
+## Show what changed since the last publish
+
+Set `show-changes: "true"` and each page compares its outputs with the `outputs.json` already on the Pages branch. New outputs get a "created" pill, changed values "updated", and removed ones a "destroyed" card at the bottom.
+
+```yaml
+      - uses: lowlydba/tofu-garnish@v1
+        with:
+          outputs-file: outputs.json
+          show-changes: "true"
+```
+
+The first publish shows no pills. Sensitive outputs are compared by name only. Needs `outputs-json` left on; details in the [Reference](reference.md#change-detection-show-changes).
+
+## Publish a preview for each pull request
+
+Publish every pull request to its own folder on the Pages branch and delete it when the PR closes. Other files on the branch are untouched, so previews sit next to your real site.
+
+Publish on each push:
+
+```yaml
+name: Preview
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+concurrency:
+  group: tofu-garnish-preview-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  preview:
+    # Fork tokens can't push to the Pages branch
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      # ...plan or apply your staging config and write outputs.json
+      - uses: lowlydba/tofu-garnish@v1
+        id: garnish
+        with:
+          outputs-file: outputs.json
+          title: Preview (PR ${{ github.event.pull_request.number }})
+          site-path: pr-preview/${{ github.event.pull_request.number }}
+          show-changes: "true"
+```
+
+Remove it when the PR closes, with no path filter so cleanup always runs:
+
+```yaml
+name: Preview cleanup
+on:
+  pull_request:
+    types: [closed]
+
+concurrency:
+  group: tofu-garnish-preview-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  cleanup:
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: lowlydba/tofu-garnish@v1
+        with:
+          remove: "true"
+          site-path: pr-preview/${{ github.event.pull_request.number }}
+```
+
+* Both workflows share a concurrency group per PR number, so a cleanup never races a late publish.
+* The `page-url` output is the preview's URL; post it with `gh pr comment --edit-last --create-if-none` to keep a single comment per PR.
+* This repository runs exactly this setup: see `.github/workflows/preview.yml` and `.github/workflows/preview-cleanup.yml`.
+
 ## Generate the HTML without deploying
 
 Set `deploy: "false"` and do whatever you like with the site directory:
@@ -138,8 +227,7 @@ host.
 
 ## Run the generator locally
 
-The generator is a single stdlib-only Python script with no dependencies to
-install:
+The generator is stdlib-only Python with nothing to install:
 
 ```console
 $ tofu output -json | python3 src/garnish.py --title "My Stack" --output-dir site
@@ -147,16 +235,12 @@ garnish: wrote site/index.html (7 outputs)
 ```
 
 Multi-workspace sites work locally too, with `--workspace name=path`
-(repeatable) and `--merge` to preserve workspaces already in the output
-directory. Set `SOURCE_DATE_EPOCH` for a reproducible timestamp.
+(repeatable) and `--merge`. Set `SOURCE_DATE_EPOCH` for a reproducible
+timestamp. All flags are in the [CLI reference](reference.md#cli-reference).
 
-No infrastructure handy? The repo ships provider-less example configs that
-produce realistic outputs:
+No infrastructure handy? The repo ships provider-less example configs:
 
 ```console
 $ tofu -chdir=examples/demo init && tofu -chdir=examples/demo apply -auto-approve
 $ tofu -chdir=examples/demo output -json | python3 src/garnish.py --output-dir site
 ```
-
-CI applies these with real OpenTofu and runs the action on the result, and
-the demo workflow publishes them to this repo's Pages.

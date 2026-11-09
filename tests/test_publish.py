@@ -17,13 +17,24 @@ FIXTURES = Path(__file__).parent / "fixtures"
 class FakeApi:
     """In-memory stand-in for the GitHub Git Data API."""
 
-    def __init__(self, tip=None, manifest=None, fail_pushes=0, page_url="https://ex.io/r/"):
+    def __init__(
+        self,
+        tip=None,
+        manifest=None,
+        fail_pushes=0,
+        page_url="https://ex.io/r/",
+        files=None,
+        large=(),
+    ):
+        self.large = set(large)
+        self.files = files or {}
         self.tip = tip
         self.manifest = manifest
         self.fail_pushes = fail_pushes
         self.page_url = page_url
         self.calls = []
         self.trees = {}
+        self.blobs = []
         self.commits = {}
         self.pushed = []
 
@@ -33,14 +44,30 @@ class FakeApi:
             if not self.tip:
                 raise ApiError(404, "no branch")
             return {"object": {"sha": self.tip}}
-        if method == "GET" and "/contents/manifest.json" in path:
-            if not self.manifest:
-                raise ApiError(404, "no manifest")
+        if method == "GET" and "/contents/" in path:
+            name = path.split("/contents/", 1)[1].split("?")[0]
             import base64
 
-            return {"content": base64.b64encode(self.manifest.encode()).decode()}
+            if name == "manifest.json" and self.manifest:
+                return {"content": base64.b64encode(self.manifest.encode()).decode()}
+            if name in self.files and name in self.large:
+                return {"encoding": "none", "content": "", "sha": "big:" + name.replace("/", "|")}
+            if name in self.files:
+                return {
+                    "encoding": "base64",
+                    "content": base64.b64encode(self.files[name].encode()).decode(),
+                }
+            raise ApiError(404, "not found")
+        if method == "GET" and "/git/blobs/" in path:
+            import base64
+
+            name = path.rsplit("/", 1)[1].removeprefix("big:").replace("|", "/")
+            return {"content": base64.b64encode(self.files[name].encode()).decode()}
         if method == "GET" and "/git/commits/" in path:
             return {"tree": {"sha": "basetree-" + path.rsplit("/", 1)[1]}}
+        if method == "POST" and path.endswith("/git/blobs"):
+            self.blobs.append(payload)
+            return {"sha": f"blob{len(self.blobs)}"}
         if method == "POST" and path.endswith("/git/trees"):
             sha = f"tree{len(self.trees)}"
             self.trees[sha] = payload
@@ -84,6 +111,7 @@ def env(monkeypatch, tmp_path):
         "GARNISH_SOURCE_URL",
         "GARNISH_FOOTER",
         "GARNISH_OUTPUTS_JSON",
+        "GARNISH_SHOW_CHANGES",
     ):
         monkeypatch.delenv(var, raising=False)
     return out
@@ -284,9 +312,72 @@ class TestPublish:
             ".nojekyll",
             "index.html",
             "manifest.json",
+            "prod/.garnish-state.json",
             "prod/index.html",
             "prod/outputs.json",
         ]
+
+    def test_state_refreshed_even_when_show_changes_off(self, env, monkeypatch):
+        monkeypatch.setenv("GARNISH_WORKSPACES", f"prod={FIXTURES / 'tofu_output_json.json'}")
+        api = FakeApi(tip="a" * 40)
+        assert run_publish(api=api, sleep=lambda _: None) == 0
+        assert any(e["path"] == "prod/.garnish-state.json" for e in api.last_tree["tree"])
+
+    def test_show_changes_badges_against_previous_publish(self, env, monkeypatch):
+        monkeypatch.setenv("GARNISH_SHOW_CHANGES", "true")
+        monkeypatch.setenv("GARNISH_WORKSPACES", f"prod={FIXTURES / 'tofu_output_json.json'}")
+        files = {"prod/outputs.json": json.dumps({"stale": 1})}
+        api = FakeApi(tip="a" * 40, files=files)
+        assert run_publish(api=api, sleep=lambda _: None) == 0
+        tree = {e["path"]: e for e in api.last_tree["tree"]}
+        page = tree["prod/index.html"]["content"]
+        assert 'class="badge added"' in page
+        assert 'class="badge destroyed"' in page
+        assert "<h2>stale " in page
+        assert "prod/.garnish-state.json" in tree
+
+    def test_show_changes_reads_files_over_the_contents_api_limit(self, env, monkeypatch):
+        monkeypatch.setenv("GARNISH_SHOW_CHANGES", "true")
+        monkeypatch.setenv("GARNISH_WORKSPACES", f"prod={FIXTURES / 'tofu_output_json.json'}")
+        files = {"prod/outputs.json": json.dumps({"stale": 1})}
+        api = FakeApi(tip="a" * 40, files=files, large={"prod/outputs.json"})
+        assert run_publish(api=api, sleep=lambda _: None) == 0
+        page = next(e for e in api.last_tree["tree"] if e["path"] == "prod/index.html")
+        assert 'class="badge destroyed"' in page["content"]
+
+    def test_show_changes_first_publish_has_no_badges(self, env, monkeypatch):
+        monkeypatch.setenv("GARNISH_SHOW_CHANGES", "true")
+        monkeypatch.setenv("GARNISH_WORKSPACES", f"prod={FIXTURES / 'tofu_output_json.json'}")
+        api = FakeApi(tip=None)
+        assert run_publish(api=api, sleep=lambda _: None) == 0
+        tree = {e["path"]: e for e in api.last_tree["tree"]}
+        assert 'class="badge' not in tree["prod/index.html"]["content"]
+        assert "prod/.garnish-state.json" in tree
+
+    def test_changes_off_by_default(self, env, monkeypatch):
+        monkeypatch.setenv("GARNISH_WORKSPACES", f"prod={FIXTURES / 'tofu_output_json.json'}")
+        files = {"prod/outputs.json": json.dumps({"stale": 1})}
+        api = FakeApi(tip="a" * 40, files=files)
+        assert run_publish(api=api, sleep=lambda _: None) == 0
+        assert not any("prod/outputs.json?" in p for _, p in api.calls)
+        page = next(e for e in api.last_tree["tree"] if e["path"] == "prod/index.html")
+        assert 'class="badge' not in page["content"]
+
+    def test_binary_files_upload_as_blobs(self, env, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "docs").mkdir()
+        (tmp_path / "docs" / "a.md").write_text("![d](pic.png)\n", encoding="utf-8")
+        (tmp_path / "docs" / "pic.png").write_bytes(b"\x89PNG\r\n\x1a\n\xff\xfe")
+        monkeypatch.setenv("GARNISH_OUTPUTS_FILE", str(FIXTURES / "tofu_output_json.json"))
+        monkeypatch.setenv("GARNISH_DOCS_DIR", "docs")
+        api = FakeApi(tip=None)
+        assert run_publish(api=api, sleep=lambda _: None) == 0
+        assert len(api.blobs) == 1
+        assert api.blobs[0]["encoding"] == "base64"
+        entry = next(e for e in api.last_tree["tree"] if e["path"].endswith("pic.png"))
+        assert entry["path"] == "docs/.assets/docs/pic.png"
+        assert entry["sha"] == "blob1"
+        assert "content" not in entry
 
     def test_discrete_update_merges_remote_manifest(self, env, monkeypatch):
         monkeypatch.setenv(
@@ -389,3 +480,53 @@ class TestMain:
         monkeypatch.setattr(publish.time, "sleep", lambda _: None)
         assert publish_main() == 0
         assert api.pushed
+
+
+class TestSitePath:
+    def test_publishes_under_prefix_and_reports_url(self, env, monkeypatch):
+        monkeypatch.setenv("GARNISH_OUTPUTS", '{"host": "example.com"}')
+        monkeypatch.setenv("GARNISH_SITE_PATH", "/pr-preview/7/")
+        api = FakeApi(tip="a" * 40)
+        assert run_publish(api=api) == 0
+        paths = {e["path"] for e in api.last_tree["tree"]}
+        assert "pr-preview/7/index.html" in paths
+        assert ".nojekyll" in paths
+        assert outputs_of(env)["page-url"] == "https://ex.io/r/pr-preview/7/"
+
+    def test_rejects_path_traversal(self, env, monkeypatch):
+        monkeypatch.setenv("GARNISH_OUTPUTS", '{"host": "example.com"}')
+        monkeypatch.setenv("GARNISH_SITE_PATH", "../x")
+        with pytest.raises(SystemExit):
+            run_publish(api=FakeApi())
+
+
+class TestRemove:
+    def _api(self):
+        api = FakeApi(tip="a" * 40)
+        base = api.__call__
+
+        def call(method, path, payload=None):
+            if method == "GET" and "/git/trees/" in path:
+                return {
+                    "tree": [
+                        {"path": "pr-preview/7/index.html", "mode": "100644", "type": "blob"},
+                        {"path": "pr-preview/7", "mode": "040000", "type": "tree"},
+                        {"path": "pr-preview/70/index.html", "mode": "100644", "type": "blob"},
+                        {"path": "index.html", "mode": "100644", "type": "blob"},
+                    ]
+                }
+            return base(method, path, payload)
+
+        return api, call
+
+    def test_deletes_only_prefix(self, env, monkeypatch):
+        monkeypatch.setenv("GARNISH_SITE_PATH", "pr-preview/7")
+        api, call = self._api()
+        assert publish.remove(api=call) == 0
+        assert api.last_tree["tree"] == [
+            {"path": "pr-preview/7/index.html", "mode": "100644", "type": "blob", "sha": None}
+        ]
+
+    def test_refuses_root(self, env, monkeypatch):
+        monkeypatch.delenv("GARNISH_SITE_PATH", raising=False)
+        assert publish.remove(api=FakeApi(tip="a" * 40)) == 1

@@ -2,6 +2,7 @@
 
 import json
 from pathlib import Path
+from urllib.parse import quote
 
 import pytest
 
@@ -191,7 +192,7 @@ class TestCopyButtons:
 class TestRenderNested:
     def test_map_becomes_tree_rows(self):
         html = render('{"vpc": {"id": "vpc-123", "cidr": "10.0.0.0/16"}}')
-        assert '<ul class="tree">' in html
+        assert '<ul class="tree" role="list">' in html
         assert '<span class="k">id</span>' in html
         assert "<code>vpc-123</code>" in html
 
@@ -210,10 +211,12 @@ class TestRenderNested:
         assert '<span class="hint">{2}</span>' in html
         assert '<span class="hint">[3]</span>' in html
 
-    def test_list_items_keyed_by_index(self):
+    def test_list_items_use_bullet_not_index(self):
         html = render('{"arns": ["arn:a", "arn:b"]}')
-        assert '<span class="k">0</span>' in html
+        assert '<span class="k item" aria-hidden="true">\u2022</span>' in html
+        assert '<span class="k">0</span>' not in html
         assert "<code>arn:a</code>" in html
+        assert "Copy &#x27;item&#x27;" in html or "Copy 'item'" in html
 
     def test_list_of_objects(self):
         html = render(fixture("tofu_output_json.json"))
@@ -318,7 +321,7 @@ class TestPageChrome:
             "now",
             source_url="https://github.com/octo/infra",
         )
-        assert '<a class="src" href="https://github.com/octo/infra">source repository</a>' in html
+        assert '<a class="act" href="https://github.com/octo/infra">Source</a>' in html
 
     def test_provenance_renders_commit_and_run_links(self):
         html = render_page(
@@ -385,7 +388,7 @@ class TestPageChrome:
                 run_url="https://github.com/octo/infra/actions/runs/42",
             ),
         )
-        assert ">abcdef1</a>" in html
+        assert ">commit abcdef1</a>" in html
         assert "workflow run</a>" in html
 
     def test_footer_links_to_tofu_garnish_repo(self):
@@ -439,14 +442,6 @@ class TestPageChrome:
             share_url="https://x.org/r/prod/",
         )
         assert 'href="https://x.org/r/prod/outputs.json">JSON</a>' in render_page(page)
-        landing = render_landing(
-            "T",
-            [("prod", "prod", 1, "now", "")],
-            "now",
-            json_links=True,
-            share_url="https://x.org/r/",
-        )
-        assert 'href="https://x.org/r/prod/outputs.json">JSON</a>' in landing
 
     def test_landing_share_button(self):
         html = render_landing(
@@ -498,9 +493,10 @@ class TestPageChrome:
             [("prod", "prod", 1, "1970-01-01 00:00 UTC", "1970-01-01T00:00:00+00:00")],
             "now",
         )
-        assert 'updated <time datetime="1970-01-01T00:00:00+00:00">1970-01-01 00:00 UTC</time>' in (
-            html
-        )
+        assert (
+            'updated <time datetime="1970-01-01T00:00:00+00:00" title="1970-01-01 00:00 UTC">'
+            "1970-01-01 00:00 UTC</time>"
+        ) in html
         assert "time[datetime]" in html
 
     def test_landing_without_iso_timestamp_renders_plain_text(self):
@@ -508,11 +504,7 @@ class TestPageChrome:
         assert "updated sometime" in html
         assert "<time" not in html
 
-    def test_landing_workspace_json_link(self):
-        html = render_landing("T", [("prod", "prod", 1, "now", "")], "now", json_links=True)
-        assert '<a class="src" href="prod/outputs.json">JSON</a>' in html
-
-    def test_landing_workspace_json_links_off_by_default(self):
+    def test_landing_has_no_workspace_json_links(self):
         html = render_landing("T", [("prod", "prod", 1, "now", "")], "now")
         assert ">JSON</a>" not in html
 
@@ -961,9 +953,7 @@ class TestMergeMode:
         out = tmp_path / "site"
         assert self._run(out, f"prod={FIXTURES / 'dflook_json_output_path.json'}") == 0
         landing = (out / "index.html").read_text(encoding="utf-8")
-        assert 'updated <time datetime="1970-01-01T00:00:00+00:00">1970-01-01 00:00 UTC</time>' in (
-            landing
-        )
+        assert 'title="1970-01-01 00:00 UTC">1970-01-01 00:00 UTC</time>' in landing
 
     def test_merge_preserves_original_timestamps(self, tmp_path, monkeypatch):
         out = tmp_path / "site"
@@ -1082,8 +1072,11 @@ class TestOutputsJson:
                 str(out),
             ]
         )
+        assert 'href="outputs.json">JSON</a>' in (out / "prod" / "index.html").read_text(
+            encoding="utf-8"
+        )
         landing = (out / "index.html").read_text(encoding="utf-8")
-        assert '<a class="src" href="prod/outputs.json">JSON</a>' in landing
+        assert ">JSON</a>" not in landing
 
     def test_no_outputs_json_flag_omits_landing_links(self, tmp_path):
         out = tmp_path / "site"
@@ -1132,3 +1125,250 @@ class TestOutputsJson:
         )
         assert rc == 0
         assert not (out / "prod" / "outputs.json").exists()
+
+
+def test_render_markdown_escapes_html_and_sanitizes_links():
+    html = garnish.render_markdown(
+        "# T\n\n<script>x</script> [bad](javascript:alert(1)) [ok](aws.md#x)"
+    )
+    assert "<script>" not in html
+    assert 'href="#"' in html
+    assert 'href="../aws/#x"' in html
+    assert 'href="#"' in garnish.render_markdown("[x](\x01javascript:alert(1)) [y](java\tscript:1)")
+
+
+def test_docs_dir_builds_pages_and_links(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    (docs / "aws.md").write_text(
+        "[← Back to README](../README.md) · [peer](other.md#x) [pic](img/a.svg)\n",
+        encoding="utf-8",
+    )
+    (docs / "other.md").write_text("[← Back](aws.md) text\n", encoding="utf-8")
+    outputs = tmp_path / "o.json"
+    outputs.write_text('{"a": "1"}', encoding="utf-8")
+    site = tmp_path / "site"
+    argv = ["--output-dir", str(site), "--docs-dir", "docs", "--source-url", "https://gh.io/o/r"]
+    assert garnish.main([*argv, "--workspace", f"prod={outputs}"]) == 0
+    page = (site / "docs" / "aws" / "index.html").read_text(encoding="utf-8")
+    assert "Back to README" not in page
+    assert 'href="../other/#x"' in page
+    assert 'href="https://gh.io/o/r/blob/HEAD/docs/img/a.svg"' in page
+    other = (site / "docs" / "other" / "index.html").read_text(encoding="utf-8")
+    assert 'href="../aws/"' in other
+    index = (site / "docs" / "index.html").read_text(encoding="utf-8")
+    assert 'href="aws/"' in index
+    assert 'href="other/"' in index
+    assert "Docs (2)" in (site / "index.html").read_text(encoding="utf-8")
+    assert 'href="../docs/"' in (site / "prod" / "index.html").read_text(encoding="utf-8")
+    # A merge run without --docs-dir keeps the recorded docs link.
+    assert (
+        garnish.main(["--output-dir", str(site), "--merge", "--workspace", f"prod={outputs}"]) == 0
+    )
+    assert "Docs (2)" in (site / "index.html").read_text(encoding="utf-8")
+
+
+def test_docs_links_without_source_url_stay_as_written(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "docs" / "a.md").write_text(
+        "[← up](../README.md) [r](../README.md) [up](../../x.md)\n", encoding="utf-8"
+    )
+    outputs = tmp_path / "o.json"
+    outputs.write_text('{"a": "1"}', encoding="utf-8")
+    argv = ["--output-dir", "site", "--docs-dir", "docs", "--input", str(outputs)]
+    assert garnish.main(argv) == 0
+    page = (tmp_path / "site" / "docs" / "a" / "index.html").read_text(encoding="utf-8")
+    assert 'href="../README.md"' in page
+    assert 'href="../../x.md"' in page
+
+
+def test_docs_images_render_and_resolve(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "docs" / "sub").mkdir(parents=True)
+    (tmp_path / "images").mkdir()
+    (tmp_path / "images" / "arch one.png").write_bytes(b"png")
+    (tmp_path / "docs" / "local.svg").write_text("<svg/>", encoding="utf-8")
+    (tmp_path / "secret.txt").write_text("s", encoding="utf-8")
+    abs_image = quote((tmp_path / "images" / "arch one.png").as_posix(), safe="")
+    (tmp_path / "docs" / "a.md").write_text(
+        "![Arch *x*](../images/arch%20one.png) ![l](local.svg) [![b](local.svg)](other.md)\n"
+        "![gone](missing.png) ![txt](../secret.txt) ![out](../../x.png) ![r](https://e.io/a.png)"
+        ' ![bad](javascript:alert(1)) ![q](local.svg "t") ![`x`](local.svg)\n'
+        "![v](../images/arch%20one.png?v=1) ![m](missing.png?v=2) `![c](local.svg)`\n"
+        f"![abs]({abs_image})\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "docs" / "sub" / "b.md").write_text("![l](../local.svg)\n", encoding="utf-8")
+    outputs = tmp_path / "o.json"
+    outputs.write_text('{"a": "1"}', encoding="utf-8")
+    argv = ["--output-dir", "site", "--docs-dir", "docs", "--input", str(outputs)]
+    assert garnish.main([*argv, "--source-url", "https://gh.io/o/r"]) == 0
+    site = tmp_path / "site" / "docs"
+    page = (site / "a" / "index.html").read_text(encoding="utf-8")
+    assert '<img src="../.assets/images/arch%20one.png" alt="Arch *x*" loading="lazy">' in page
+    assert (
+        '<a href="https://gh.io/o/r/blob/HEAD/docs/other.md"><img src="../.assets/docs/local.svg"'
+        in page
+    )
+    assert (site / ".assets" / "images" / "arch one.png").read_bytes() == b"png"
+    assert (site / ".assets" / "docs" / "local.svg").exists()
+    assert 'src="https://gh.io/o/r/raw/HEAD/docs/missing.png"' in page
+    assert 'src="https://gh.io/o/r/raw/HEAD/secret.txt"' in page
+    assert not (site / ".assets" / "secret.txt").exists()
+    assert 'src="../../x.png"' in page
+    assert 'src="https://e.io/a.png"' in page
+    assert 'src="#" alt="bad"' in page
+    assert '<img src="../.assets/docs/local.svg" alt="q" loading="lazy">' in page
+    assert '<img src="../.assets/docs/local.svg" alt="x" loading="lazy">' in page
+    assert 'src="../.assets/images/arch%20one.png?v=1"' in page
+    assert 'src="https://gh.io/o/r/raw/HEAD/docs/missing.png?v=2"' in page
+    assert "<code>![c](local.svg)</code>" in page
+    assert 'alt="abs"' in page
+    assert "!<a" not in page
+    nested = (site / "sub" / "b" / "index.html").read_text(encoding="utf-8")
+    assert 'src="../../.assets/docs/local.svg"' in nested
+
+
+def test_docs_image_symlink_to_non_image_is_not_copied(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "secret.txt").write_text("s", encoding="utf-8")
+    try:
+        (tmp_path / "docs" / "leak.svg").symlink_to(tmp_path / "secret.txt")
+    except OSError:
+        pytest.skip("symlinks unavailable")
+    (tmp_path / "docs" / "a.md").write_text("![l](leak.svg)", encoding="utf-8")
+    outputs = tmp_path / "o.json"
+    outputs.write_text('{"a": "1"}', encoding="utf-8")
+    argv = ["--output-dir", "site", "--docs-dir", "docs", "--input", str(outputs)]
+    assert garnish.main([*argv, "--source-url", "https://gh.io/o/r"]) == 0
+    assert not (tmp_path / "site" / "docs" / ".assets").exists()
+    page = (tmp_path / "site" / "docs" / "a" / "index.html").read_text(encoding="utf-8")
+    assert 'src="https://gh.io/o/r/raw/HEAD/docs/leak.svg"' in page
+
+
+def test_docs_images_without_source_url_stay_as_written(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "docs" / "a.md").write_text("![m](missing.png) <b>", encoding="utf-8")
+    outputs = tmp_path / "o.json"
+    outputs.write_text('{"a": "1"}', encoding="utf-8")
+    argv = ["--output-dir", "site", "--docs-dir", "docs", "--input", str(outputs)]
+    assert garnish.main(argv) == 0
+    page = (tmp_path / "site" / "docs" / "a" / "index.html").read_text(encoding="utf-8")
+    assert 'src="missing.png"' in page
+
+
+def test_render_markdown_images_without_resolver():
+    html = garnish.render_markdown('![a "b"](x/y.md) ![<s>](z.png)')
+    assert '<img src="x/y.md" alt="a &quot;b&quot;" loading="lazy">' in html
+    assert 'alt="&lt;s&gt;"' in html
+
+
+def test_docs_dir_missing_and_clashing(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    outputs = tmp_path / "o.json"
+    outputs.write_text('{"a": "1"}', encoding="utf-8")
+    base = ["--output-dir", "site", "--input", str(outputs)]
+    assert garnish.main([*base, "--docs-dir", "nope"]) == 2
+    assert garnish.main([*base, "--docs-dir", "nope", "--workspace", f"p={outputs}"]) == 2
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "docs" / "A b.md").write_text("one", encoding="utf-8")
+    (tmp_path / "docs" / "a-b.md").write_text("two", encoding="utf-8")
+    assert garnish.main([*base, "--docs-dir", "docs"]) == 2
+    assert "clashes" in capsys.readouterr().err
+
+
+def test_docs_nested_folders_mirror_layout(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    docs = tmp_path / "docs"
+    (docs / "aws").mkdir(parents=True)
+    (docs / "gcp").mkdir()
+    (docs / "top.md").write_text("[s](aws/setup.md) [g](gcp/setup.md)\n", encoding="utf-8")
+    (docs / "aws" / "setup.md").write_text(
+        "# AWS setup\n\n[t](../top.md) [g](../gcp/setup.md)\n", encoding="utf-8"
+    )
+    (docs / "gcp" / "setup.md").write_text("# GCP setup\n", encoding="utf-8")
+    outputs = tmp_path / "o.json"
+    outputs.write_text('{"a": "1"}', encoding="utf-8")
+    argv = ["--output-dir", "site", "--docs-dir", "docs", "--input", str(outputs)]
+    assert garnish.main(argv) == 0
+    site = tmp_path / "site" / "docs"
+    nested = (site / "aws" / "setup" / "index.html").read_text(encoding="utf-8")
+    assert 'href="../../../">' in nested
+    assert 'href="../../">All docs' in nested
+    assert 'href="../../top/"' in nested
+    assert 'href="../../gcp/setup/"' in nested
+    top = (site / "top" / "index.html").read_text(encoding="utf-8")
+    assert 'href="../aws/setup/"' in top
+    index = (site / "index.html").read_text(encoding="utf-8")
+    assert 'href="aws/setup/"' in index
+    assert "<p>aws/</p>" in index
+    assert index.index(">top<") < index.index("AWS setup") < index.index("GCP setup")
+
+
+def test_render_markdown_blocks():
+    html = garnish.render_markdown(
+        "# Title\n\n"
+        "para **bold** *em* `a<b`\n\n"
+        "```\n<raw>\n```\n\n"
+        "1. one\n2. two\n\n"
+        "> quoted\n> more\n\n"
+        "---\n\n"
+        "| h1 | h2 |\n| -- | -- |\n| c1 | c2 |\n"
+    )
+    assert '<h1 id="title">Title<a class="anchor" href="#title"' in html
+    assert "<strong>bold</strong>" in html
+    assert "<em>em</em>" in html
+    assert "<code>a&lt;b</code>" in html
+    assert "<pre><code>&lt;raw&gt;</code></pre>" in html
+    assert "<ol><li>one</li><li>two</li></ol>" in html
+    assert "<blockquote><p>quoted more</p></blockquote>" in html
+    assert "<hr>" in html
+    assert "<th>h1</th>" in html
+    assert "<td>c2</td>" in html
+
+
+def test_heading_ids_are_unique_and_github_style():
+    html = garnish.render_markdown("## Set `up` it!\n\n## Set up it\n\n## !!!\n")
+    assert 'id="set-up-it"' in html
+    assert 'id="set-up-it-1"' in html
+    assert 'id="section"' in html
+
+
+def test_heading_ids_and_titles_keep_underscores():
+    html = garnish.render_markdown("## Lookup `vpc_id`\n")
+    assert 'id="lookup-vpc_id"' in html
+    assert garnish.doc_title("# Use `vpc_id`\n", "fb") == "Use vpc_id"
+
+
+def test_docs_links_decode_percent_encoded_paths(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    (docs / "AWS Setup.md").write_text("# AWS\n", encoding="utf-8")
+    (docs / "top.md").write_text("[a](AWS%20Setup.md) [r](My%20File.txt)\n", encoding="utf-8")
+    outputs = tmp_path / "o.json"
+    outputs.write_text('{"a": "1"}', encoding="utf-8")
+    argv = ["--output-dir", "site", "--docs-dir", "docs", "--input", str(outputs)]
+    argv += ["--source-url", "https://github.com/o/r"]
+    assert garnish.main(argv) == 0
+    top = (tmp_path / "site" / "docs" / "top" / "index.html").read_text(encoding="utf-8")
+    assert 'href="../aws-setup/"' in top
+    assert "/blob/HEAD/docs/My%20File.txt" in top
+    assert garnish._md_href("AWS%20Setup.md") == "../aws-setup/"
+
+
+def test_doc_title():
+    assert garnish.doc_title("intro\n# My [link](x) `code`\n", "fb") == "My link code"
+    assert garnish.doc_title("no heading", "fb") == "fb"
+
+
+def test_docs_workspace_name_reserved(tmp_path):
+    outputs = tmp_path / "o.json"
+    outputs.write_text('{"a": "1"}', encoding="utf-8")
+    assert (
+        garnish.main(["--output-dir", str(tmp_path / "s"), "--workspace", f"docs={outputs}"]) == 2
+    )

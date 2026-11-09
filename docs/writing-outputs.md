@@ -2,6 +2,14 @@
 
 # Writing outputs.tf for a good garnish page
 
+On this page:
+
+- [Name outputs so alphabetical order reads well](#name-outputs-so-alphabetical-order-reads-well)
+- [Always set description](#always-set-description)
+- [Keep sibling objects shape-uniform](#keep-sibling-objects-shape-uniform)
+- [Mark sensitive outputs sensitive](#mark-sensitive-outputs-sensitive)
+- [Flatten what should be copy-button-friendly](#flatten-what-should-be-copy-button-friendly)
+
 This page is for whoever (or whatever) is authoring `outputs.tf`, not for
 consuming the action. Point an AI coding agent at it (link it from your
 repo's `AGENTS.md`/`CLAUDE.md`) when you want generated Tofu to render well
@@ -44,8 +52,8 @@ output "vpc_id" {
 
 ## Keep sibling objects shape-uniform
 
-A list of dicts becomes a tree with one collapsible node per item (keyed by
-its index), each listing that item's keys. Uniform shapes make the items easy
+A list of dicts becomes a tree with one collapsible node per item (marked with
+a bullet rather than an index), each listing that item's keys. Uniform shapes make the items easy
 to compare at a glance, so keep the keys consistent:
 
 ```hcl
@@ -75,7 +83,7 @@ output "db_password" {
 ```
 
 `sensitive = true` masks the value on the page and drops it from
-`outputs.json` entirely (see [sensitive value handling](explanation.md#sensitive-values)).
+`outputs.json` entirely (see [sensitive value handling](explanation.md#how-are-sensitive-values-handled)).
 Don't rely on a vague name or a missing description to hide something that
 belongs in a secrets manager instead of an output.
 
